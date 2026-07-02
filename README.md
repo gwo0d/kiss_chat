@@ -36,7 +36,19 @@ handful of small Rust modules — simplicity of both architecture and code is th
 - Network access for internet-wide connections (peer discovery uses iroh's public
   relay/DNS infrastructure)
 
-## Build
+## Install
+
+Install the latest release from [crates.io](https://crates.io/crates/kiss_chat) with Cargo:
+
+```bash
+cargo install kiss_chat
+```
+
+This puts a `kiss_chat` binary on your `PATH` (in `~/.cargo/bin/`). Anywhere the docs below use
+`cargo run`, you can run `kiss_chat` instead — e.g. `kiss_chat` to start in the lobby, or
+`kiss_chat <peer-id>` to dial a peer directly.
+
+## Build from source
 
 ```bash
 cargo build --release
