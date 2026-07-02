@@ -137,7 +137,7 @@ impl App {
         self.push_system(format!("connecting to {peer_short}…"));
     }
 
-    /// Enter the verify step once a channel is established: the safety number must
+    /// Enter the verify step once a channel is established: the safety words must
     /// be compared out-of-band before chatting begins.
     pub fn set_verifying(&mut self, peer_short: String, safety_number: String) {
         self.mode = Mode::Verifying;
@@ -145,13 +145,13 @@ impl App {
         self.safety_number = safety_number.clone();
         // A display name from a previous peer must not leak into this session.
         self.peer_name = None;
-        self.status = format!("verify {} · safety {}", self.peer_short, safety_number);
+        self.status = format!("verify {} · compare the safety words", self.peer_short);
         self.push_system("channel up — now verify you're talking to the right person:");
-        self.push_system(format!("  safety number:  {safety_number}"));
-        self.push_system("compare it with your peer over a trusted channel (say it aloud, etc.).");
-        self.push_system("names aren't shared yet — the safety number is what you trust.");
-        self.push_system("  /accept   the numbers match — start chatting");
-        self.push_system("  /reject   they differ — disconnect");
+        self.push_system(format!("  safety words:  {safety_number}"));
+        self.push_system("read them aloud with your peer over a trusted channel — every word");
+        self.push_system("must match, in order. The safety words are what you trust, not names.");
+        self.push_system("  /accept   every word matches — start chatting");
+        self.push_system("  /reject   any word differs — disconnect");
     }
 
     /// Transition from verifying to an active chat once the user accepts.
@@ -162,16 +162,12 @@ impl App {
     }
 
     /// The status-bar text for an active chat, folding in the peer's name if known.
+    /// The safety words live in the verify history, not here — they're too long for
+    /// the status bar, and re-showable with `/safety`.
     fn connected_status(&self) -> String {
         match &self.peer_name {
-            Some(name) => format!(
-                "connected to {name} ({}) · safety {}",
-                self.peer_short, self.safety_number
-            ),
-            None => format!(
-                "connected to {} · safety {}",
-                self.peer_short, self.safety_number
-            ),
+            Some(name) => format!("connected to {name} ({})", self.peer_short),
+            None => format!("connected to {}", self.peer_short),
         }
     }
 
@@ -352,7 +348,7 @@ impl App {
                 Action::Send(line)
             }
             Mode::Verifying => {
-                self.push_system("verify the safety number first: /accept or /reject");
+                self.push_system("compare the safety words first: /accept or /reject");
                 Action::None
             }
             _ => {
@@ -416,6 +412,14 @@ impl App {
                 self.push_system(format!("your address: {address}"));
                 Action::None
             }
+            "safety" | "s" => {
+                if self.safety_number.is_empty() {
+                    self.push_system("no safety words yet — connect to a peer first");
+                } else {
+                    self.push_system(format!("  safety words:  {}", self.safety_number));
+                }
+                Action::None
+            }
             "clear" => {
                 self.history.clear();
                 self.scroll_lines = 0;
@@ -431,12 +435,13 @@ impl App {
                     "  /connect <peer-id>   dial a peer (switches if already connected)",
                 );
                 self.push_system(
-                    "  /accept              accept the peer after verifying the safety number",
+                    "  /accept              accept the peer after comparing the safety words",
                 );
                 self.push_system("  /reject              reject the peer being verified");
                 self.push_system(
                     "  /name [text]         set your display name (empty clears); shared on /accept",
                 );
+                self.push_system("  /safety              re-show the current safety words");
                 self.push_system("  /address             show your own address to share");
                 self.push_system("  /clear               clear the screen");
                 self.push_system("  /help                show this help");
@@ -792,10 +797,7 @@ mod tests {
         let _ = submit_line(&mut app, "/clear");
         assert!(app.history.is_empty());
         assert!(matches!(submit_line(&mut app, "/address"), Action::None));
-        assert!(app
-            .history
-            .iter()
-            .any(|line| line.text.contains("my-addr")));
+        assert!(app.history.iter().any(|line| line.text.contains("my-addr")));
     }
 
     #[test]

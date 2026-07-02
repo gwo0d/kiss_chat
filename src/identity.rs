@@ -41,7 +41,14 @@ pub fn load_or_create_endpoint_secret() -> Result<SecretKey> {
 
 /// Load the persistent 32-byte ML-DSA authentication seed, creating one on first run.
 pub fn load_or_create_auth_seed() -> Result<[u8; 32]> {
-    load_or_create_key(&config_dir()?, AUTH_SEED_FILE, rand::random::<[u8; 32]>)
+    load_or_create_key(&config_dir()?, AUTH_SEED_FILE, random_seed)
+}
+
+/// A fresh 32-byte seed drawn straight from the operating system CSPRNG.
+fn random_seed() -> [u8; 32] {
+    let mut seed = [0u8; 32];
+    getrandom::fill(&mut seed).expect("operating system CSPRNG must be available");
+    seed
 }
 
 /// Load the saved display name, if the user has ever set one.
@@ -128,6 +135,12 @@ fn config_dir() -> Result<PathBuf> {
 }
 
 /// Write 32 secret bytes as hex, restricted to owner-only on unix.
+///
+/// On non-unix platforms (Windows) we can't set a POSIX mode, so the file
+/// inherits the ACLs of its parent directory. In practice these keys live under
+/// the user's profile (`%USERPROFILE%`/`$HOME`), which is not readable by other
+/// standard users by default — but on a machine with a deliberately world-readable
+/// config directory this offers weaker protection than the unix `0o600`.
 fn write_secret(path: &Path, bytes: &[u8; 32]) -> Result<()> {
     let hex = encode_hex(bytes);
     #[cfg(unix)]

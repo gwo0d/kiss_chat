@@ -6,7 +6,8 @@
 //!
 //! In-app commands (the input line is a command prompt until a peer is connected):
 //!   /connect <peer-id>     dial a peer (switches peers if already connected)
-//!   /accept, /reject       accept or reject a peer after comparing the safety number
+//!   /accept, /reject       accept or reject a peer after comparing the safety words
+//!   /safety                re-show the current session's safety words
 //!   /name [text]           set your (optional) display name; only shared after /accept
 //!   /clear                 clear the screen
 //!   /help                  list commands
@@ -38,7 +39,7 @@ use crossterm::event::{Event, KeyEvent, KeyEventKind};
 use iroh::endpoint::{Connection, RecvStream, SendStream};
 use iroh::{Endpoint, EndpointId};
 use ratatui::DefaultTerminal;
-use tokio::sync::mpsc::{self, UnboundedReceiver, UnboundedSender};
+use tokio::sync::mpsc::{self, Sender, UnboundedReceiver, UnboundedSender};
 use tokio::task::JoinHandle;
 
 use crate::crypto::{Opener, Sealer, Session};
@@ -47,6 +48,12 @@ use crate::ui::{Action, App, NetEvent};
 
 /// How long to wait for a peer to acknowledge our goodbye before closing anyway.
 const FAREWELL_TIMEOUT: Duration = Duration::from_secs(1);
+
+/// Capacity of the decrypted-network-event queue. Bounding it applies backpressure
+/// to the reader task — and, through it, to the QUIC stream's own flow control — so
+/// a peer flooding messages faster than the UI can render them can't grow this
+/// queue without limit and exhaust memory.
+const NET_EVENT_QUEUE: usize = 256;
 
 /// A freshly established, encrypted session, handed from a handshake task to the loop.
 struct Established {
@@ -133,7 +140,7 @@ async fn run(
     });
 
     let (conn_tx, mut conn_rx) = mpsc::unbounded_channel::<ConnResult>();
-    let (net_tx, mut net_rx) = mpsc::unbounded_channel::<NetEvent>();
+    let (net_tx, mut net_rx) = mpsc::channel::<NetEvent>(NET_EVENT_QUEUE);
 
     // Listen for an incoming peer whenever we're not in a session.
     let mut accept_handle = arm_accept(&endpoint, my_id, auth_seed, &conn_tx);
@@ -391,10 +398,13 @@ async fn accept_and_handshake(
 }
 
 /// Decrypt inbound frames and forward messages (or a disconnect) to the UI.
+///
+/// `net_tx` is bounded, so a slow UI stalls this `send`, which stops us reading
+/// the next frame and lets QUIC flow control throttle a flooding peer.
 fn spawn_reader(
     mut recv: RecvStream,
     mut opener: Opener,
-    net_tx: UnboundedSender<NetEvent>,
+    net_tx: Sender<NetEvent>,
 ) -> JoinHandle<()> {
     tokio::spawn(async move {
         loop {
@@ -415,7 +425,7 @@ fn spawn_reader(
                 Err(err) => NetEvent::Disconnected(format!("connection lost: {err}")),
             };
             let done = matches!(event, NetEvent::Disconnected(_));
-            if net_tx.send(event).is_err() || done {
+            if net_tx.send(event).await.is_err() || done {
                 break;
             }
         }

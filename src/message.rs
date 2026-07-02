@@ -12,8 +12,10 @@
 //!
 //! Display names are purely cosmetic and self-asserted: the trust anchor is the
 //! handshake's safety number, never the name. So we sanitise received names
-//! (strip control characters, cap the length) before showing them, and never
-//! let them influence identity verification.
+//! (strip control *and* invisible/bidirectional formatting characters, cap the
+//! length) before showing them, and never let them influence identity
+//! verification. Chat text gets the same control-character stripping so a peer
+//! can't inject terminal escape sequences.
 
 /// Longest display name we keep, in characters. Anything longer is truncated.
 pub const MAX_NAME_CHARS: usize = 32;
@@ -64,26 +66,57 @@ pub fn encode(message: &Outgoing) -> Vec<u8> {
 /// Decode a decrypted plaintext frame received from the peer.
 pub fn decode(plaintext: &[u8]) -> Incoming {
     match plaintext.split_first() {
-        Some((&TAG_TEXT, body)) => Incoming::Text(String::from_utf8_lossy(body).into_owned()),
+        Some((&TAG_TEXT, body)) => Incoming::Text(sanitize_text(&String::from_utf8_lossy(body))),
         Some((&TAG_BYE, _)) => Incoming::Bye,
         Some((&TAG_NAME, body)) => Incoming::Name(sanitize_name(&String::from_utf8_lossy(body))),
         _ => Incoming::Malformed,
     }
 }
 
+/// Invisible and bidirectional formatting characters used in "Trojan Source"-style
+/// spoofing. These are *not* caught by [`char::is_control`], so we list them
+/// explicitly; stripping them stops a peer from reordering or hiding text in our
+/// terminal via a display name.
+fn is_bidi_or_invisible(c: char) -> bool {
+    matches!(
+        c,
+        '\u{00AD}'                 // soft hyphen
+        | '\u{061C}'               // Arabic letter mark
+        | '\u{200B}'..='\u{200F}'  // zero-width space, (non-)joiners, LRM/RLM
+        | '\u{202A}'..='\u{202E}'  // bidi embeddings & overrides
+        | '\u{2060}'..='\u{2064}'  // word joiner, invisible operators
+        | '\u{2066}'..='\u{2069}'  // bidi isolates
+        | '\u{FEFF}'               // zero-width no-break space / BOM
+        | '\u{FFF9}'..='\u{FFFB}'  // interlinear annotation marks
+    )
+}
+
 /// Normalise a display name for storage, sending, and display.
 ///
-/// Strips control characters (so a peer can't smuggle newlines or escape
-/// sequences into our terminal), trims surrounding whitespace, and caps the
-/// length. Returns `None` when nothing usable is left — the caller treats that
-/// as "no display name".
+/// Strips control characters and the invisible/bidirectional formatting
+/// characters above (so a peer can't smuggle newlines, escape sequences, or a
+/// right-to-left override into our terminal), trims surrounding whitespace, and
+/// caps the length. Returns `None` when nothing usable is left — the caller
+/// treats that as "no display name".
 pub fn sanitize_name(raw: &str) -> Option<String> {
-    let cleaned: String = raw.chars().filter(|c| !c.is_control()).collect();
+    let cleaned: String = raw
+        .chars()
+        .filter(|&c| !c.is_control() && !is_bidi_or_invisible(c))
+        .collect();
     let trimmed = cleaned.trim();
     if trimmed.is_empty() {
         return None;
     }
     Some(trimmed.chars().take(MAX_NAME_CHARS).collect())
+}
+
+/// Strip terminal control characters from peer-supplied chat text so a peer can't
+/// inject ANSI escape sequences (screen clears, cursor moves, title rewrites) into
+/// our terminal. Printable content — emoji, non-Latin scripts — is preserved, so
+/// unlike names we leave bidirectional marks alone (ratatui renders per-cell, and
+/// stripping them would corrupt legitimate right-to-left messages).
+fn sanitize_text(raw: &str) -> String {
+    raw.chars().filter(|c| !c.is_control()).collect()
 }
 
 #[cfg(test)]
@@ -159,6 +192,40 @@ mod tests {
         match decode(&encode(&Outgoing::Name(Some("bad\nname".into())))) {
             Incoming::Name(Some(name)) => assert_eq!(name, "badname"),
             _ => panic!("expected a sanitised name"),
+        }
+    }
+
+    #[test]
+    fn sanitize_strips_bidi_and_zero_width() {
+        // U+202E (RLO) could visually reverse the label; U+200B is invisible.
+        assert_eq!(
+            sanitize_name("Al\u{202E}i\u{200B}ce").as_deref(),
+            Some("Alice")
+        );
+    }
+
+    #[test]
+    fn a_name_that_is_only_formatting_chars_sanitises_away() {
+        assert_eq!(sanitize_name("\u{202E}\u{200B}\u{FEFF}"), None);
+    }
+
+    #[test]
+    fn text_strips_escape_sequences_but_keeps_printable() {
+        // A peer's chat line carrying an ANSI escape must not reach the terminal.
+        match decode(&encode(&Outgoing::Text("hi\u{1b}[2Kthere".into()))) {
+            Incoming::Text(text) => {
+                assert!(!text.contains('\u{1b}'), "escape byte must be stripped");
+                assert_eq!(text, "hi[2Kthere");
+            }
+            _ => panic!("expected text"),
+        }
+    }
+
+    #[test]
+    fn text_preserves_emoji_and_non_latin() {
+        match decode(&encode(&Outgoing::Text("héllo 🌍 مرحبا".into()))) {
+            Incoming::Text(text) => assert_eq!(text, "héllo 🌍 مرحبا"),
+            _ => panic!("expected text"),
         }
     }
 }
