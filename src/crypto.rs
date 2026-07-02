@@ -4,9 +4,10 @@
 //! of it we run a small handshake that is quantum-resistant end to end:
 //!
 //! 1. A **hybrid key exchange** combining classical X25519 ECDH with post-quantum
-//!    ML-KEM-768. The session key survives even if *one* of the two primitives is
-//!    later broken — the same construction shipped by Chrome/Cloudflare/AWS in TLS.
-//! 2. **Post-quantum mutual authentication** with ML-DSA-65 (FIPS 204). Each peer
+//!    ML-KEM-1024 (NIST security category 5). The session key survives even if *one*
+//!    of the two primitives is later broken — the same construction shipped by
+//!    Chrome/Cloudflare/AWS in TLS.
+//! 2. **Post-quantum mutual authentication** with ML-DSA-87 (FIPS 204, category 5). Each peer
 //!    holds a long-term ML-DSA identity key and signs the full handshake transcript,
 //!    so a man-in-the-middle cannot impersonate a known identity even with a quantum
 //!    computer. The signatures bind the ephemeral keys to the identity keys.
@@ -33,26 +34,26 @@ use anyhow::{Result, anyhow, ensure};
 use chacha20poly1305::{ChaCha20Poly1305, Key, KeyInit, Nonce, aead::Aead};
 use hkdf::Hkdf;
 use ml_dsa::{
-    B32, EncodedSignature, EncodedVerifyingKey, Keypair, MlDsa65, Signature, SigningKey, Verifier,
+    B32, EncodedSignature, EncodedVerifyingKey, Keypair, MlDsa87, Signature, SigningKey, Verifier,
     VerifyingKey,
 };
 use ml_kem::kem::{Decapsulate, Encapsulate, KeyExport};
 use ml_kem::{
-    Ciphertext, DecapsulationKey768, EncapsulationKey768, Kem, MlKem768, kem::Key as KemKey,
+    Ciphertext, DecapsulationKey1024, EncapsulationKey1024, Kem, MlKem1024, kem::Key as KemKey,
 };
 use sha2::{Digest, Sha256};
 use x25519_dalek::{PublicKey, StaticSecret};
 
 /// Length of an X25519 public key, in bytes.
 const X25519_LEN: usize = 32;
-/// Encoded length of an ML-KEM-768 encapsulation key (FIPS 203).
-const MLKEM_EK_LEN: usize = 1184;
-/// Encoded length of an ML-KEM-768 ciphertext (FIPS 203).
-const MLKEM_CT_LEN: usize = 1088;
-/// Encoded length of an ML-DSA-65 verifying (public) key (FIPS 204).
-const MLDSA_VK_LEN: usize = 1952;
-/// Encoded length of an ML-DSA-65 signature (FIPS 204).
-const MLDSA_SIG_LEN: usize = 3309;
+/// Encoded length of an ML-KEM-1024 encapsulation key (FIPS 203).
+const MLKEM_EK_LEN: usize = 1568;
+/// Encoded length of an ML-KEM-1024 ciphertext (FIPS 203).
+const MLKEM_CT_LEN: usize = 1568;
+/// Encoded length of an ML-DSA-87 verifying (public) key (FIPS 204).
+const MLDSA_VK_LEN: usize = 2592;
+/// Encoded length of an ML-DSA-87 signature (FIPS 204).
+const MLDSA_SIG_LEN: usize = 4627;
 
 /// HKDF `info` domain-separation prefix. Bumped whenever the wire format changes.
 const HKDF_INFO_PREFIX: &[u8] = b"kiss-chat/0 e2e session";
@@ -73,19 +74,19 @@ pub enum Role {
     Responder,
 }
 
-/// A long-term ML-DSA-65 identity used to authenticate the handshake.
+/// A long-term ML-DSA-87 identity used to authenticate the handshake.
 ///
 /// Built deterministically from a persistent 32-byte seed (see [`crate::identity`]),
 /// so the same seed always yields the same public identity.
 pub struct SigningIdentity {
-    signing_key: SigningKey<MlDsa65>,
+    signing_key: SigningKey<MlDsa87>,
     verifying_key: Vec<u8>,
 }
 
 impl SigningIdentity {
     /// Derive the identity from its 32-byte seed.
     pub fn from_seed(seed: &[u8; 32]) -> Self {
-        let signing_key = SigningKey::<MlDsa65>::from_seed(&B32::from(*seed));
+        let signing_key = SigningKey::<MlDsa87>::from_seed(&B32::from(*seed));
         let verifying_key = signing_key.verifying_key().encode().to_vec();
         Self {
             signing_key,
@@ -114,7 +115,7 @@ impl SigningIdentity {
 
 /// State the initiator holds between sending msg1 and receiving msg2.
 pub struct Initiator {
-    dk: DecapsulationKey768,
+    dk: DecapsulationKey1024,
     x_secret: StaticSecret,
     identity: SigningIdentity,
     /// msg1 == the initiator's transcript contribution (`ek || x_pub || vk_I`).
@@ -123,7 +124,7 @@ pub struct Initiator {
 
 /// Build the initiator's first handshake message.
 pub fn initiator_start(identity: SigningIdentity) -> Initiator {
-    let (dk, ek) = MlKem768::generate_keypair();
+    let (dk, ek) = MlKem1024::generate_keypair();
     let x_secret = StaticSecret::from(rand::random::<[u8; 32]>());
     let x_pub = PublicKey::from(&x_secret);
 
@@ -165,7 +166,7 @@ impl Initiator {
             sig_r.len()
         );
 
-        let ct = Ciphertext::<MlKem768>::try_from(ct_bytes)
+        let ct = Ciphertext::<MlKem1024>::try_from(ct_bytes)
             .map_err(|_| anyhow!("malformed ML-KEM ciphertext"))?;
         let ss_kem = self.dk.decapsulate(&ct);
         let ss_dh = self.x_secret.diffie_hellman(&x25519_public(their_x)?);
@@ -214,9 +215,9 @@ pub fn responder_receive(
         initiator_vk.len()
     );
 
-    let ek_key = KemKey::<EncapsulationKey768>::try_from(ek_bytes)
+    let ek_key = KemKey::<EncapsulationKey1024>::try_from(ek_bytes)
         .map_err(|_| anyhow!("malformed ML-KEM encapsulation key"))?;
-    let ek = EncapsulationKey768::new(&ek_key)
+    let ek = EncapsulationKey1024::new(&ek_key)
         .map_err(|_| anyhow!("invalid ML-KEM encapsulation key"))?;
     let (ct, ss_kem) = ek.encapsulate();
 
@@ -279,12 +280,12 @@ fn x25519_public(bytes: &[u8]) -> Result<PublicKey> {
 
 /// Verify an ML-DSA signature `sig` over `digest` against the encoded `vk`.
 fn verify_signature(vk: &[u8], digest: &[u8; 32], sig: &[u8]) -> Result<()> {
-    let vk_enc = EncodedVerifyingKey::<MlDsa65>::try_from(vk)
+    let vk_enc = EncodedVerifyingKey::<MlDsa87>::try_from(vk)
         .map_err(|_| anyhow!("malformed ML-DSA key"))?;
-    let verifying_key = VerifyingKey::<MlDsa65>::decode(&vk_enc);
-    let sig_enc = EncodedSignature::<MlDsa65>::try_from(sig)
+    let verifying_key = VerifyingKey::<MlDsa87>::decode(&vk_enc);
+    let sig_enc = EncodedSignature::<MlDsa87>::try_from(sig)
         .map_err(|_| anyhow!("malformed ML-DSA signature"))?;
-    let signature = Signature::<MlDsa65>::decode(&sig_enc)
+    let signature = Signature::<MlDsa87>::decode(&sig_enc)
         .ok_or_else(|| anyhow!("invalid ML-DSA signature"))?;
     verifying_key
         .verify(digest, &signature)

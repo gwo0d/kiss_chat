@@ -85,6 +85,8 @@ pub struct App {
     safety_number: String,
     /// The peer's chosen display name, once they share it (only after accepting).
     peer_name: Option<String>,
+    /// Our own address, kept so `/address` can recall it after `/clear`.
+    my_address: String,
     pub should_quit: bool,
 }
 
@@ -101,6 +103,7 @@ impl App {
             peer_short: String::new(),
             safety_number: String::new(),
             peer_name: None,
+            my_address: my_address.clone(),
             should_quit: false,
         };
         app.push_system("welcome to kiss_chat");
@@ -408,6 +411,11 @@ impl App {
                     Action::None
                 }
             }
+            "address" | "addr" => {
+                let address = self.my_address.clone();
+                self.push_system(format!("your address: {address}"));
+                Action::None
+            }
             "clear" => {
                 self.history.clear();
                 self.scroll_lines = 0;
@@ -429,6 +437,7 @@ impl App {
                 self.push_system(
                     "  /name [text]         set your display name (empty clears); shared on /accept",
                 );
+                self.push_system("  /address             show your own address to share");
                 self.push_system("  /clear               clear the screen");
                 self.push_system("  /help                show this help");
                 self.push_system("  /quit                exit (or Esc / Ctrl-C)");
@@ -775,6 +784,18 @@ mod tests {
         assert!(!app.history.is_empty());
         assert!(matches!(submit_line(&mut app, "/clear"), Action::None));
         assert!(app.history.is_empty());
+    }
+
+    #[test]
+    fn address_command_recalls_own_address_after_clear() {
+        let mut app = App::new("my-addr".into());
+        let _ = submit_line(&mut app, "/clear");
+        assert!(app.history.is_empty());
+        assert!(matches!(submit_line(&mut app, "/address"), Action::None));
+        assert!(app
+            .history
+            .iter()
+            .any(|line| line.text.contains("my-addr")));
     }
 
     #[test]
