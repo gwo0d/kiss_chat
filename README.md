@@ -12,12 +12,12 @@ handful of small Rust modules — simplicity of both architecture and code is th
 - **Stable identity.** Your address is derived from a secret key that is generated once and
   saved to disk, so it stays the same across restarts — share it once and peers can always
   reach you.
-- **Quantum-resistant E2E encryption.** A hybrid **X25519 + ML-KEM-768** handshake derives the
+- **Quantum-resistant E2E encryption.** A hybrid **X25519 + ML-KEM-1024** handshake derives the
   session key, so your traffic stays confidential even against a future quantum computer
   ("harvest-now, decrypt-later"). Messages are sealed with ChaCha20-Poly1305.
-- **Post-quantum authentication.** Each peer holds a long-term **ML-DSA-65** (FIPS 204) identity
+- **Post-quantum authentication.** Each peer holds a long-term **ML-DSA-87** (FIPS 204) identity
   and signs the handshake transcript, so authentication — not just confidentiality — resists a
-  quantum adversary. You confirm the peer once by comparing a short **safety number**.
+  quantum adversary. You confirm the peer once by comparing a short list of **safety words**.
 - **Tiny and readable.** A handful of small, focused modules. Nothing clever you have to
   reverse-engineer.
 - **Terminal UI.** Scrolling history with word-wrap, timestamps, scrollback, and line editing.
@@ -65,11 +65,13 @@ identity on another machine. An optional `name` file (not a secret) holds your d
 
 ### Verifying the peer
 
-When a channel comes up, kiss_chat pauses before chat and shows a **safety number** derived from
-both peers' post-quantum identities — the same value on both ends. Compare it with your peer over
-a trusted channel (say it aloud, a phone call, etc.), then `/accept` if it matches or `/reject`
-if it doesn't. Verifying once is enough: the ML-DSA signatures in the handshake bind the session
-to that identity, so a man-in-the-middle would show a *different* safety number.
+When a channel comes up, kiss_chat pauses before chat and shows a short phrase of **safety words**
+derived from the whole handshake — both peers' identities *and* the session's fresh ephemeral keys —
+the same phrase on both ends. Read it aloud with your peer over a trusted channel (say it aloud, a
+phone call, etc.), then `/accept` if every word matches in order or `/reject` if any differs.
+Verifying once is enough: the ML-DSA signatures in the handshake bind the session to that identity,
+so a man-in-the-middle would show a *different* phrase. Because the words also cover the ephemeral
+keys, they can't be precomputed offline, and `/safety` re-shows them at any time.
 
 ### In-app commands
 
@@ -78,9 +80,11 @@ The input line doubles as a command prompt:
 | Command | Action |
 |---------|--------|
 | `/connect <peer-id>` | dial a peer; if already connected, leaves that peer and switches (alias `/c`) |
-| `/accept` | accept the peer after the safety number matches (alias `/a`) |
+| `/accept` | accept the peer after every safety word matches (alias `/a`) |
 | `/reject` | reject the peer being verified and return to the lobby (alias `/r`) |
 | `/name [text]` | set your optional display name; empty clears it (alias `/n`) |
+| `/safety` | re-show the current session's safety words (alias `/s`) |
+| `/address` | show your own address to share (alias `/addr`) |
 | `/clear` | clear the screen |
 | `/help` | list commands (alias `/h`, `/?`) |
 | `/quit` | exit (alias `/q`; also <kbd>Esc</kbd> or <kbd>Ctrl-C</kbd>) |
@@ -90,13 +94,14 @@ Editing keys: <kbd>←</kbd>/<kbd>→</kbd>, <kbd>Home</kbd>/<kbd>End</kbd>, <kb
 (start/end). <kbd>PageUp</kbd>/<kbd>PageDown</kbd> scroll the history.
 
 Once accepted, both sides get the same chat view — type a line and press <kbd>Enter</kbd> to send.
-The status bar shows the peer and the session **safety number**. Message timestamps are in UTC.
+The status bar shows the connected peer; recall the **safety words** any time with `/safety`.
+Message timestamps are in UTC.
 
 ### Display names
 
 You can set an optional display name with `/name <text>` (`/name` alone clears it). It's purely
-cosmetic and self-asserted, so it is deliberately **never** part of verification: the safety number
-stays your only trust anchor. A name is shared with a peer only *after* you `/accept` them, and it
+cosmetic and self-asserted, so it is deliberately **never** part of verification: the safety words
+stay your only trust anchor. A name is shared with a peer only *after* you `/accept` them, and it
 travels inside the same end-to-end-encrypted, authenticated frames as your chat messages — never in
 the clear and never during the verify step. Received names are sanitised (control characters
 stripped, length capped) before display. Your name persists across runs in the `name` file.
@@ -131,7 +136,7 @@ iroh already provides an authenticated, TLS-1.3-encrypted QUIC channel. On top o
 kiss_chat runs a three-message, mutually-authenticated handshake **inside** the stream (the
 dialer is the *initiator*, the accepter the *responder*):
 
-1. **I→R:** ML-KEM-768 encapsulation key, an X25519 public key, and the initiator's ML-DSA
+1. **I→R:** ML-KEM-1024 encapsulation key, an X25519 public key, and the initiator's ML-DSA
    identity key.
 2. **R→I:** ML-KEM ciphertext, an X25519 public key, the responder's ML-DSA identity key, and a
    signature over the whole transcript.
@@ -144,20 +149,22 @@ classical secret is *hybrid* key exchange (the 2026 industry default): the sessi
 confidential as long as **either** primitive holds. Each message is then sealed with
 ChaCha20-Poly1305 using deterministic, per-direction nonce counters.
 
-The **safety number** is a short fingerprint of both peers' ML-DSA identity keys, identical on
-both ends. Comparing it out-of-band authenticates the identities: under a man-in-the-middle the
-two ends would compute different safety numbers.
+The **safety words** are a short fingerprint of the whole transcript — both identity keys, both
+ephemeral keys, and both iroh EndpointIds — rendered as a 12-word phrase (BIP39 wordlist) and
+identical on both ends. Comparing it out-of-band authenticates the channel: under a man-in-the-middle
+the two ends would compute different phrases. Binding the ephemeral keys (not just the long-term
+identities) means the phrase can't be mined offline, so a MITM can't precompute a colliding identity.
 
 ## Security notes
 
 - **Confidentiality** against both classical and quantum adversaries via the hybrid KEM.
 - **Authentication** is post-quantum: each peer signs the handshake transcript with a long-term
-  ML-DSA-65 key, and the transport (QUIC/TLS) authenticates the iroh identity underneath. The
-  signatures bind the ephemeral keys to the identity key, so the out-of-band **safety number**
+  ML-DSA-87 key, and the transport (QUIC/TLS) authenticates the iroh identity underneath. The
+  signatures bind the ephemeral keys to the identity key, so the out-of-band **safety words**
   check is what roots trust — verify it once and a MITM cannot impersonate that identity, even
   with a quantum computer.
 - kiss_chat does **not** persist a contact list, so peer identities are trusted on first use
-  (verified via the safety number). It re-verifies via signatures every session but will not, on
+  (verified via the safety words). It re-verifies via signatures every session but will not, on
   its own, warn you if a *previously seen* peer presents a new identity key.
 - The `ml-kem` and `ml-dsa` crates are pure-Rust FIPS 203/204 implementations that have **not**
   had an independent security audit. Treat kiss_chat as a simple, educational P2P chat, not a

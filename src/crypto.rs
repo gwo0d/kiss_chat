@@ -17,10 +17,13 @@
 //!    counters (QUIC is reliable and in-order, so counters stay in lockstep and no
 //!    nonce is ever reused).
 //!
-//! The **safety number** ([`Session::safety_number`]) is derived from both peers'
-//! ML-DSA identity keys and is identical on both ends. Comparing it out-of-band
-//! authenticates the identity keys themselves: under a MITM the two ends would see
-//! different safety numbers. Verify it once and the signatures do the rest.
+//! The **safety number** ([`Session::safety_number`]) is derived from the full
+//! handshake transcript — both identity keys, both ephemeral keys, and both iroh
+//! EndpointIds — and rendered as a short word phrase (BIP39 wordlist) that is
+//! identical on both ends. Reading it aloud out-of-band authenticates the channel:
+//! under a MITM the two ends would see different phrases. Folding in the ephemeral
+//! keys means the value cannot be precomputed offline, so a MITM cannot mine
+//! colliding identities ahead of time. Verify it once and the signatures do the rest.
 //!
 //! Handshake wire format (the dialer is the *initiator*, the accepter the *responder*):
 //!
@@ -43,6 +46,7 @@ use ml_kem::{
 };
 use sha2::{Digest, Sha256};
 use x25519_dalek::{PublicKey, StaticSecret};
+use zeroize::{Zeroize, Zeroizing};
 
 /// Length of an X25519 public key, in bytes.
 const X25519_LEN: usize = 32;
@@ -61,11 +65,34 @@ const HKDF_INFO_PREFIX: &[u8] = b"kiss-chat/0 e2e session";
 const SIG_CONTEXT: &[u8] = b"kiss-chat/0 handshake signature";
 /// Domain separator for the safety-number derivation.
 const SN_CONTEXT: &[u8] = b"kiss-chat/0 safety number";
+/// Words in the safety phrase we surface out-of-band, and bits each encodes.
+/// 12 words × 11 bits = 132 bits, so even a MITM's best online collision search
+/// (~2^66 hashes) stays out of reach, while a dozen distinct words are far easier
+/// to read aloud and compare accurately than a hex string.
+const SN_WORDS: usize = 12;
+const SN_WORD_BITS: usize = 11;
+
+/// The BIP39 English wordlist (2048 = 2^11 words), embedded verbatim. It only has
+/// to be consistent between two kiss_chat instances — we use it purely to render a
+/// digest as a memorable phrase — but a vetted, phonetically-distinct list keeps
+/// spoken comparison reliable. SHA-256: 2f5eed53…3b24dbda.
+const BIP39_ENGLISH: &str = include_str!("bip39-english.txt");
 
 /// Nonce direction tag for initiator -> responder traffic.
 const DIR_I2R: [u8; 4] = [0, 0, 0, 1];
 /// Nonce direction tag for responder -> initiator traffic.
 const DIR_R2I: [u8; 4] = [0, 0, 0, 2];
+
+/// 32 fresh bytes drawn straight from the operating system CSPRNG.
+///
+/// We read the OS entropy source explicitly rather than leaning on a library's
+/// default RNG, so key generation stays sound even if a dependency ever changes
+/// which RNG its `random()` helper picks.
+fn random_bytes() -> [u8; 32] {
+    let mut bytes = [0u8; 32];
+    getrandom::fill(&mut bytes).expect("operating system CSPRNG must be available");
+    bytes
+}
 
 /// Which side of the handshake we are. The dialer is always the initiator.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -125,7 +152,7 @@ pub struct Initiator {
 /// Build the initiator's first handshake message.
 pub fn initiator_start(identity: SigningIdentity) -> Initiator {
     let (dk, ek) = MlKem1024::generate_keypair();
-    let x_secret = StaticSecret::from(rand::random::<[u8; 32]>());
+    let x_secret = StaticSecret::from(random_bytes());
     let x_pub = PublicKey::from(&x_secret);
 
     let mut msg1 = ek.to_bytes().to_vec();
@@ -184,7 +211,7 @@ impl Initiator {
         verify_signature(responder_vk, &digest, sig_r)?;
 
         let key = derive_key(ss_kem.as_slice(), ss_dh.as_bytes(), &transcript);
-        let safety = safety_number(self.identity.public_bytes(), responder_vk);
+        let safety = safety_number(&transcript);
         let sig_i = self.identity.sign(&digest);
         Ok((Session::new(key, Role::Initiator, safety), sig_i))
     }
@@ -221,7 +248,7 @@ pub fn responder_receive(
         .map_err(|_| anyhow!("invalid ML-KEM encapsulation key"))?;
     let (ct, ss_kem) = ek.encapsulate();
 
-    let x_secret = StaticSecret::from(rand::random::<[u8; 32]>());
+    let x_secret = StaticSecret::from(random_bytes());
     let x_pub = PublicKey::from(&x_secret);
     let ss_dh = x_secret.diffie_hellman(&x25519_public(their_x)?);
 
@@ -233,7 +260,7 @@ pub fn responder_receive(
     let digest = signing_digest(&transcript);
 
     let key = derive_key(ss_kem.as_slice(), ss_dh.as_bytes(), &transcript);
-    let safety = safety_number(initiator_vk, identity.public_bytes());
+    let safety = safety_number(&transcript);
     let session = Session::new(key, Role::Responder, safety);
 
     let mut msg2 = msg2_core;
@@ -322,7 +349,8 @@ fn signing_digest(transcript: &[u8]) -> [u8; 32] {
 /// `ikm = ss_kem || ss_dh` (hybrid), `salt = SHA256(transcript)` (binds identities,
 /// iroh IDs, and both ephemeral keys), and `info` domain-separates the output.
 fn derive_key(ss_kem: &[u8], ss_dh: &[u8; 32], transcript: &[u8]) -> [u8; 32] {
-    let mut ikm = Vec::with_capacity(ss_kem.len() + X25519_LEN);
+    // The combined input keying material is secret; scrub it once we're done.
+    let mut ikm = Zeroizing::new(Vec::with_capacity(ss_kem.len() + X25519_LEN));
     ikm.extend_from_slice(ss_kem);
     ikm.extend_from_slice(ss_dh);
 
@@ -334,25 +362,46 @@ fn derive_key(ss_kem: &[u8], ss_dh: &[u8; 32], transcript: &[u8]) -> [u8; 32] {
     key
 }
 
-/// A short, order-independent fingerprint of both peers' identity keys, for
-/// out-of-band verification. Both ends compute the same value.
-fn safety_number(vk_a: &[u8], vk_b: &[u8]) -> String {
-    // Sort so the value is symmetric regardless of who dialed whom.
-    let (lo, hi) = if vk_a <= vk_b {
-        (vk_a, vk_b)
-    } else {
-        (vk_b, vk_a)
-    };
+/// A short, human-comparable fingerprint of the whole handshake, rendered as a
+/// [`SN_WORDS`]-word phrase for out-of-band verification. Both ends compute the
+/// same value.
+///
+/// It is derived from the full transcript — which commits to both identity keys,
+/// both *ephemeral* keys, and both iroh EndpointIds — not the long-term identity
+/// keys alone. Binding the ephemeral keys is what defeats an *offline* collision
+/// search: a MITM can no longer precompute identities whose fingerprints coincide,
+/// because every session folds in fresh ephemeral material it cannot know in
+/// advance. Any collision search is forced into the live handshake, and at 132
+/// bits even a real-time birthday grind (~2^66 hashes) is out of reach. The
+/// transcript is already byte-identical on both ends — the signatures prove it —
+/// so no sorting is needed for symmetry.
+fn safety_number(transcript: &[u8]) -> String {
     let digest = Sha256::new()
         .chain_update(SN_CONTEXT)
-        .chain_update(lo)
-        .chain_update(hi)
+        .chain_update(transcript)
         .finalize();
-    digest[..8]
-        .chunks(2)
-        .map(|pair| format!("{:02x}{:02x}", pair[0], pair[1]))
+    let words: Vec<&str> = BIP39_ENGLISH.lines().collect();
+    debug_assert_eq!(
+        words.len(),
+        1 << SN_WORD_BITS,
+        "wordlist must be 2^11 entries"
+    );
+    (0..SN_WORDS)
+        .map(|i| words[take_bits(&digest, i * SN_WORD_BITS, SN_WORD_BITS)])
         .collect::<Vec<_>>()
-        .join("-")
+        .join(" ")
+}
+
+/// Read `n` bits (n ≤ 16) from `bytes` starting at bit `offset`, most-significant
+/// bit first, as an integer. Used to slice the digest into wordlist indices.
+fn take_bits(bytes: &[u8], offset: usize, n: usize) -> usize {
+    let mut value = 0usize;
+    for i in 0..n {
+        let bit = offset + i;
+        let set = (bytes[bit / 8] >> (7 - (bit % 8))) & 1;
+        value = (value << 1) | set as usize;
+    }
+    value
 }
 
 /// An established, authenticated, quantum-resistant session.
@@ -363,6 +412,14 @@ pub struct Session {
     key: [u8; 32],
     role: Role,
     safety_number: String,
+}
+
+impl Drop for Session {
+    /// Scrub the raw session key from memory when the session ends. (The `Sealer`
+    /// and `Opener` ciphers zeroize their own copies via the `zeroize` feature.)
+    fn drop(&mut self) {
+        self.key.zeroize();
+    }
 }
 
 impl Session {
@@ -586,11 +643,36 @@ mod tests {
     }
 
     #[test]
-    fn a_different_identity_key_changes_the_safety_number() {
-        // A MITM substituting its own identity key would change what each side sees.
-        let (a, _b) = handshake();
-        let mitm = safety_number(identity(1).public_bytes(), identity(3).public_bytes());
-        assert_ne!(a.safety_number(), mitm);
+    fn safety_number_is_bound_to_the_transcript() {
+        // Different transcripts (a MITM's spliced handshake differs from the real
+        // one on both ends) must yield different fingerprints; the same transcript
+        // is stable.
+        let one = safety_number(b"transcript-one");
+        assert_eq!(one, safety_number(b"transcript-one"));
+        assert_ne!(one, safety_number(b"transcript-two"));
+    }
+
+    #[test]
+    fn safety_number_is_a_valid_word_phrase() {
+        // Twelve space-separated words, each drawn from the embedded wordlist.
+        let wordlist: std::collections::HashSet<&str> = BIP39_ENGLISH.lines().collect();
+        assert_eq!(wordlist.len(), 1 << SN_WORD_BITS, "2048 distinct words");
+
+        let phrase = safety_number(b"anything");
+        let words: Vec<&str> = phrase.split(' ').collect();
+        assert_eq!(words.len(), SN_WORDS);
+        assert!(
+            words.iter().all(|w| wordlist.contains(w)),
+            "every word must come from the wordlist"
+        );
+    }
+
+    #[test]
+    fn take_bits_reads_big_endian() {
+        // 0xA6 = 0b1010_0110, 0xC0 = 0b1100_0000.
+        let bytes = [0xA6, 0xC0];
+        assert_eq!(take_bits(&bytes, 0, 5), 0b10100);
+        assert_eq!(take_bits(&bytes, 5, 6), 0b110110);
     }
 
     #[test]
