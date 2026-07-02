@@ -15,14 +15,14 @@ strip = true
 
 [dependencies]
 anyhow = "1.0.103"
-chacha20poly1305 = "0.11.0"
+chacha20poly1305 = { version = "0.11.0", features = ["zeroize"] }
 crossterm = { version = "0.29.0", features = ["event-stream"] }
 hkdf = "0.13.0"
 iroh = "1.0.1"
-ml-dsa = "0.1.1"
+ml-dsa = { version = "0.1.1", features = ["zeroize"] }
 ml-kem = { version = "0.3.2", features = ["getrandom", "zeroize"] }
 rand = "0.10.1"
 ratatui = "0.30.2"
-sha2 = "0.11.0"
+sha2 = { version = "0.11.0", features = ["zeroize"] }
 tokio = { version = "1.52.3", features = ["rt-multi-thread", "macros", "sync", "io-util", "net", "rt"] }
-x25519-dalek = { version = "2.0.1", features = ["static_secrets"] }
+x25519-dalek = { version = "2.0.1", features = ["static_secrets", "zeroize"] }
