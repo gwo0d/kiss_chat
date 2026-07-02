@@ -1,7 +1,7 @@
 [package]
 name = "kiss_chat"
 description = "A quantum-resistant, naïvely implemented, end-to-end encryption tool written in Rust, naturally. Keep It Simple, Stupid!"
-version = "0.2.0"
+version = "0.2.1"
 edition = "2024"
 authors = ["George O. Wood <git@gwood.dev>"]
 license = "GPL-3.0-or-later"
