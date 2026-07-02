@@ -9,12 +9,18 @@ handful of small Rust modules — simplicity of both architecture and code is th
 
 - **Peer-to-peer.** No central server holds your messages. Peers connect directly over QUIC,
   with NAT traversal handled for you — dial someone by their public key.
+- **Stable identity.** Your address is derived from a secret key that is generated once and
+  saved to disk, so it stays the same across restarts — share it once and peers can always
+  reach you.
 - **Quantum-resistant E2E encryption.** A hybrid **X25519 + ML-KEM-768** handshake derives the
   session key, so your traffic stays confidential even against a future quantum computer
   ("harvest-now, decrypt-later"). Messages are sealed with ChaCha20-Poly1305.
-- **Tiny and readable.** ~850 lines across five focused modules. Nothing clever you have to
+- **Post-quantum authentication.** Each peer holds a long-term **ML-DSA-65** (FIPS 204) identity
+  and signs the handshake transcript, so authentication — not just confidentiality — resists a
+  quantum adversary. You confirm the peer once by comparing a short **safety number**.
+- **Tiny and readable.** A handful of small, focused modules. Nothing clever you have to
   reverse-engineer.
-- **Terminal UI.** A simple scrolling history with an input line.
+- **Terminal UI.** Scrolling history with word-wrap, timestamps, scrollback, and line editing.
 
 ## Requirements
 
@@ -52,6 +58,19 @@ cargo run
 cargo run -- 96aedec725a0104933cfd73a2722b3497b13307100a242ccb47efe9cb1fafa39
 ```
 
+Your keys live in `$XDG_CONFIG_HOME/kiss_chat/` (falling back to `~/.config/kiss_chat/`),
+owner-readable only: `secret.key` is your iroh address and `auth.key` is your ML-DSA
+authentication seed. Delete them to rotate to a fresh identity; copy them to run as the same
+identity on another machine.
+
+### Verifying the peer
+
+When a channel comes up, kiss_chat pauses before chat and shows a **safety number** derived from
+both peers' post-quantum identities — the same value on both ends. Compare it with your peer over
+a trusted channel (say it aloud, a phone call, etc.), then `/accept` if it matches or `/reject`
+if it doesn't. Verifying once is enough: the ML-DSA signatures in the handshake bind the session
+to that identity, so a man-in-the-middle would show a *different* safety number.
+
 ### In-app commands
 
 The input line doubles as a command prompt:
@@ -59,13 +78,18 @@ The input line doubles as a command prompt:
 | Command | Action |
 |---------|--------|
 | `/connect <peer-id>` | dial a peer; if already connected, leaves that peer and switches (alias `/c`) |
+| `/accept` | accept the peer after the safety number matches (alias `/a`) |
+| `/reject` | reject the peer being verified and return to the lobby (alias `/r`) |
 | `/clear` | clear the screen |
 | `/help` | list commands (alias `/h`, `/?`) |
 | `/quit` | exit (alias `/q`; also <kbd>Esc</kbd> or <kbd>Ctrl-C</kbd>) |
 
-Once connected, both sides get the same chat view — type a line and press <kbd>Enter</kbd> to
-send. The status bar shows the peer and a short session **fingerprint**, identical on both ends
-when the channel is genuine.
+Editing keys: <kbd>←</kbd>/<kbd>→</kbd>, <kbd>Home</kbd>/<kbd>End</kbd>, <kbd>Delete</kbd>, and
+<kbd>Ctrl-U</kbd> (clear line), <kbd>Ctrl-W</kbd> (delete word), <kbd>Ctrl-A</kbd>/<kbd>Ctrl-E</kbd>
+(start/end). <kbd>PageUp</kbd>/<kbd>PageDown</kbd> scroll the history.
+
+Once accepted, both sides get the same chat view — type a line and press <kbd>Enter</kbd> to send.
+The status bar shows the peer and the session **safety number**. Message timestamps are in UTC.
 
 When you leave — by quitting, or by `/connect`-ing to someone else — kiss_chat sends the peer a
 goodbye so they see a clean "peer left the chat" notice rather than a stalled connection. Either
@@ -83,52 +107,64 @@ side dropping returns you to the lobby, where you can `/connect` to someone new.
 
 | Module | Responsibility |
 |--------|----------------|
+| `identity` | persistent on-disk keys (iroh address + ML-DSA auth seed) |
 | `transport` | iroh endpoint: bind, dial-by-key, accept (QUIC + NAT traversal) |
 | `proto` | length-prefixed framing over the stream |
 | `message` | 1-byte-tagged in-band protocol (chat text vs. a `Bye` control frame) |
-| `crypto` | hybrid handshake, key derivation, ChaCha20-Poly1305 session |
+| `crypto` | hybrid KEX, ML-DSA authentication, key derivation, ChaCha20-Poly1305 session |
 | `ui` | terminal interface (pure state machine) |
 | `main` | the event loop wiring input, connection tasks, and the UI together |
 
-### The encryption, briefly
+### The handshake, briefly
 
 iroh already provides an authenticated, TLS-1.3-encrypted QUIC channel. On top of that,
-kiss_chat runs a two-message handshake **inside** the stream:
+kiss_chat runs a three-message, mutually-authenticated handshake **inside** the stream (the
+dialer is the *initiator*, the accepter the *responder*):
 
-1. The dialer (initiator) sends its ML-KEM-768 encapsulation key and an X25519 public key.
-2. The listener (responder) replies with an ML-KEM ciphertext and its own X25519 public key.
-3. Both sides now share two secrets — one post-quantum, one classical.
+1. **I→R:** ML-KEM-768 encapsulation key, an X25519 public key, and the initiator's ML-DSA
+   identity key.
+2. **R→I:** ML-KEM ciphertext, an X25519 public key, the responder's ML-DSA identity key, and a
+   signature over the whole transcript.
+3. **I→R:** the initiator's signature over the transcript.
 
-Those are combined as `ikm = ml_kem_secret || x25519_secret` and run through HKDF-SHA256,
-salted with the full handshake transcript and bound to both peers' identities. Concatenating a
-post-quantum and a classical secret is *hybrid* key exchange (the 2026 industry default): the
-session stays secure as long as **either** primitive holds. Each message is then encrypted with
+Both sides then share two secrets — one post-quantum (ML-KEM), one classical (X25519) — combined
+as `ikm = ml_kem_secret || x25519_secret` and run through HKDF-SHA256, salted with the transcript
+(which includes both identity keys and both iroh EndpointIds). Concatenating a post-quantum and a
+classical secret is *hybrid* key exchange (the 2026 industry default): the session stays
+confidential as long as **either** primitive holds. Each message is then sealed with
 ChaCha20-Poly1305 using deterministic, per-direction nonce counters.
+
+The **safety number** is a short fingerprint of both peers' ML-DSA identity keys, identical on
+both ends. Comparing it out-of-band authenticates the identities: under a man-in-the-middle the
+two ends would compute different safety numbers.
 
 ## Security notes
 
 - **Confidentiality** against both classical and quantum adversaries via the hybrid KEM.
-- **Authentication** is currently classical: the QUIC/TLS handshake authenticates the peer's
-  iroh identity, and that identity is mixed into the key derivation. Post-quantum *signatures*
-  (ML-DSA) for identity are not yet implemented — a MITM would need to break the transport
-  authentication *now*, whereas the confidentiality guarantee is what defends recorded traffic
-  against future decryption.
-- The `ml-kem` crate is a pure-Rust FIPS 203 implementation that has **not** had an independent
-  security audit. Treat kiss_chat as a simple, educational P2P chat, not a hardened product.
-- Verify the session fingerprint out-of-band (e.g. read it to each other) if you want assurance
-  against a man-in-the-middle beyond the transport layer.
+- **Authentication** is post-quantum: each peer signs the handshake transcript with a long-term
+  ML-DSA-65 key, and the transport (QUIC/TLS) authenticates the iroh identity underneath. The
+  signatures bind the ephemeral keys to the identity key, so the out-of-band **safety number**
+  check is what roots trust — verify it once and a MITM cannot impersonate that identity, even
+  with a quantum computer.
+- kiss_chat does **not** persist a contact list, so peer identities are trusted on first use
+  (verified via the safety number). It re-verifies via signatures every session but will not, on
+  its own, warn you if a *previously seen* peer presents a new identity key.
+- The `ml-kem` and `ml-dsa` crates are pure-Rust FIPS 203/204 implementations that have **not**
+  had an independent security audit. Treat kiss_chat as a simple, educational P2P chat, not a
+  hardened product.
 
 ## Testing
 
 ```bash
-cargo test          # crypto unit tests + a full-stack loopback integration test
+cargo test          # crypto/identity/ui unit tests + full-stack loopback integration tests
 cargo clippy --all-targets
 ```
 
-The integration test spins up two real iroh endpoints on loopback and runs a complete
-connect → handshake → encrypted round-trip.
+The integration tests spin up two real iroh endpoints on loopback and run a complete
+connect → three-message authenticated handshake → encrypted round-trip.
 
 ## Not (yet) included
 
-Group chat, message history on disk, file transfer, post-quantum identity signatures, and an
-in-UI fingerprint-verification prompt. The architecture leaves room for each without a rewrite.
+Group chat, message history on disk, file transfer, a persistent contact list (identity-key
+pinning with change warnings), and local-time timestamps. The architecture leaves room for each
+without a rewrite.

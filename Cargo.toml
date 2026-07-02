@@ -9,6 +9,7 @@ chacha20poly1305 = "0.11.0"
 crossterm = { version = "0.29.0", features = ["event-stream"] }
 hkdf = "0.13.0"
 iroh = "1.0.1"
+ml-dsa = "0.1.1"
 ml-kem = { version = "0.3.2", features = ["getrandom", "zeroize"] }
 rand = "0.10.1"
 ratatui = "0.30.2"

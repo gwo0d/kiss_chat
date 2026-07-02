@@ -4,18 +4,33 @@
 //! fallback) and dialing by public key via DNS discovery — so this module stays
 //! tiny. It hands back the raw `(Connection, SendStream, RecvStream)`; the
 //! post-quantum handshake and encryption live one layer up in [`crate::crypto`].
+//!
+//! The endpoint is bound with a *persistent* identity (see [`crate::identity`]):
+//! the iroh secret key is generated once and stored on disk, so your
+//! [`EndpointId`] — the address you share with peers — stays the same across runs.
+//!
+//! [`EndpointId`]: iroh::EndpointId
 
 use anyhow::{Context, Result};
 use iroh::endpoint::{Connection, RecvStream, SendStream, presets};
 use iroh::{Endpoint, EndpointAddr};
+
+use crate::identity;
 
 /// Application-layer protocol identifier negotiated during the QUIC handshake.
 pub const ALPN: &[u8] = b"kiss-chat/0";
 
 /// Bind an endpoint using the N0 preset (relay + DNS discovery enabled), which
 /// lets peers be reached by [`EndpointId`] alone.
+///
+/// Loads (or, on first run, creates) a persistent identity so the endpoint keeps
+/// the same address between runs.
+///
+/// [`EndpointId`]: iroh::EndpointId
 pub async fn bind() -> Result<Endpoint> {
+    let secret_key = identity::load_or_create_endpoint_secret()?;
     Endpoint::builder(presets::N0)
+        .secret_key(secret_key)
         .alpns(vec![ALPN.to_vec()])
         .bind()
         .await
@@ -51,6 +66,7 @@ pub async fn accept(endpoint: &Endpoint) -> Result<(Connection, SendStream, Recv
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::crypto::SigningIdentity;
     use crate::{crypto, message, proto};
     use iroh::endpoint::presets;
     use std::time::Duration;
@@ -94,10 +110,16 @@ mod tests {
                 let (conn, mut send, mut recv) = accept(&server).await.unwrap();
                 let peer = conn.remote_id();
                 let msg1 = proto::read_frame(&mut recv).await.unwrap();
-                let (session, msg2) =
-                    crypto::responder_respond(&msg1, peer.as_bytes(), server.id().as_bytes())
-                        .unwrap();
+                let (pending, msg2) = crypto::responder_receive(
+                    &msg1,
+                    peer.as_bytes(),
+                    server.id().as_bytes(),
+                    SigningIdentity::from_seed(&[2u8; 32]),
+                )
+                .unwrap();
                 proto::write_frame(&mut send, &msg2).await.unwrap();
+                let msg3 = proto::read_frame(&mut recv).await.unwrap();
+                let session = pending.finish(&msg3).unwrap();
 
                 let (mut sealer, mut opener) = session.split();
                 let plaintext = opener
@@ -115,12 +137,15 @@ mod tests {
 
             // Client: dial, run the initiator handshake, send + verify the echo.
             let (conn, mut send, mut recv) = dial(&client, server_addr).await.unwrap();
-            let initiator = crypto::initiator_start();
-            proto::write_frame(&mut send, initiator.msg1()).await.unwrap();
+            let initiator = crypto::initiator_start(SigningIdentity::from_seed(&[1u8; 32]));
+            proto::write_frame(&mut send, initiator.msg1())
+                .await
+                .unwrap();
             let msg2 = proto::read_frame(&mut recv).await.unwrap();
-            let session = initiator
+            let (session, msg3) = initiator
                 .finish(&msg2, client.id().as_bytes(), server_id.as_bytes())
                 .unwrap();
+            proto::write_frame(&mut send, &msg3).await.unwrap();
 
             let (mut sealer, mut opener) = session.split();
             proto::write_frame(&mut send, &sealer.seal(b"ping over PQ").unwrap())
@@ -156,14 +181,23 @@ mod tests {
                 let (conn, mut send, mut recv) = accept(&server).await.unwrap();
                 let peer = conn.remote_id();
                 let msg1 = proto::read_frame(&mut recv).await.unwrap();
-                let (session, msg2) =
-                    crypto::responder_respond(&msg1, peer.as_bytes(), server.id().as_bytes())
-                        .unwrap();
+                let (pending, msg2) = crypto::responder_receive(
+                    &msg1,
+                    peer.as_bytes(),
+                    server.id().as_bytes(),
+                    SigningIdentity::from_seed(&[2u8; 32]),
+                )
+                .unwrap();
                 proto::write_frame(&mut send, &msg2).await.unwrap();
+                let msg3 = proto::read_frame(&mut recv).await.unwrap();
+                let session = pending.finish(&msg3).unwrap();
 
                 let (mut sealer, mut opener) = session.split();
                 let frame = proto::read_frame(&mut recv).await.unwrap();
-                let is_bye = matches!(message::decode(&opener.open(&frame).unwrap()), message::Incoming::Bye);
+                let is_bye = matches!(
+                    message::decode(&opener.open(&frame).unwrap()),
+                    message::Incoming::Bye
+                );
                 proto::write_frame(&mut send, &sealer.seal(b"ack").unwrap())
                     .await
                     .unwrap();
@@ -174,20 +208,28 @@ mod tests {
             // Client: handshake, send a Bye, then read the ack (which confirms the
             // Bye was delivered) before closing.
             let (conn, mut send, mut recv) = dial(&client, server_addr).await.unwrap();
-            let initiator = crypto::initiator_start();
-            proto::write_frame(&mut send, initiator.msg1()).await.unwrap();
+            let initiator = crypto::initiator_start(SigningIdentity::from_seed(&[1u8; 32]));
+            proto::write_frame(&mut send, initiator.msg1())
+                .await
+                .unwrap();
             let msg2 = proto::read_frame(&mut recv).await.unwrap();
-            let session = initiator
+            let (session, msg3) = initiator
                 .finish(&msg2, client.id().as_bytes(), server_id.as_bytes())
                 .unwrap();
+            proto::write_frame(&mut send, &msg3).await.unwrap();
 
             let (mut sealer, _opener) = session.split();
-            let bye = sealer.seal(&message::encode(&message::Outgoing::Bye)).unwrap();
+            let bye = sealer
+                .seal(&message::encode(&message::Outgoing::Bye))
+                .unwrap();
             proto::write_frame(&mut send, &bye).await.unwrap();
             let _ack = proto::read_frame(&mut recv).await.unwrap();
             conn.close(0u32.into(), b"done");
 
-            assert!(server_task.await.unwrap(), "server should decode a Bye frame");
+            assert!(
+                server_task.await.unwrap(),
+                "server should decode a Bye frame"
+            );
         })
         .await;
 

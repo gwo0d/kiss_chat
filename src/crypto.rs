@@ -1,36 +1,65 @@
-//! End-to-end encryption for kiss_chat.
+//! End-to-end encryption **and authentication** for kiss_chat.
 //!
-//! The design is deliberately small. iroh already hands us an authenticated,
-//! TLS-1.3-encrypted QUIC stream, so all we add here is a *quantum-resistant*
-//! session key on top of it:
+//! iroh already hands us an authenticated, TLS-1.3-encrypted QUIC stream. On top
+//! of it we run a small handshake that is quantum-resistant end to end:
 //!
-//! 1. A two-message **hybrid handshake** combining classical X25519 ECDH with
-//!    post-quantum ML-KEM-768. The session key survives even if *one* of the two
-//!    primitives is later broken — this is the same construction shipped by
-//!    Chrome/Cloudflare/AWS in TLS.
-//! 2. Both secrets are folded into HKDF-SHA256, salted with the full handshake
-//!    transcript and bound to both peers' iroh identities, so a man-in-the-middle
-//!    would have to break the transport authentication *and* the KEM.
-//! 3. Messages are sealed with ChaCha20-Poly1305 using deterministic, per-direction
-//!    nonce counters (QUIC delivers the stream reliably and in order, so both sides
-//!    keep their counters in lockstep and no nonce is ever reused).
+//! 1. A **hybrid key exchange** combining classical X25519 ECDH with post-quantum
+//!    ML-KEM-768. The session key survives even if *one* of the two primitives is
+//!    later broken — the same construction shipped by Chrome/Cloudflare/AWS in TLS.
+//! 2. **Post-quantum mutual authentication** with ML-DSA-65 (FIPS 204). Each peer
+//!    holds a long-term ML-DSA identity key and signs the full handshake transcript,
+//!    so a man-in-the-middle cannot impersonate a known identity even with a quantum
+//!    computer. The signatures bind the ephemeral keys to the identity keys.
+//! 3. Both shared secrets are folded into HKDF-SHA256, salted with the transcript
+//!    (which includes both identity keys and both iroh EndpointIds), then messages
+//!    are sealed with ChaCha20-Poly1305 using deterministic per-direction nonce
+//!    counters (QUIC is reliable and in-order, so counters stay in lockstep and no
+//!    nonce is ever reused).
+//!
+//! The **safety number** ([`Session::safety_number`]) is derived from both peers'
+//! ML-DSA identity keys and is identical on both ends. Comparing it out-of-band
+//! authenticates the identity keys themselves: under a MITM the two ends would see
+//! different safety numbers. Verify it once and the signatures do the rest.
+//!
+//! Handshake wire format (the dialer is the *initiator*, the accepter the *responder*):
+//!
+//! ```text
+//!   msg1  I -> R :  ml_kem_ek || x25519_pub || ml_dsa_vk_I
+//!   msg2  R -> I :  ml_kem_ct || x25519_pub || ml_dsa_vk_R || sig_R(transcript)
+//!   msg3  I -> R :  sig_I(transcript)
+//! ```
 
-use anyhow::{Result, ensure};
+use anyhow::{Result, anyhow, ensure};
 use chacha20poly1305::{ChaCha20Poly1305, Key, KeyInit, Nonce, aead::Aead};
 use hkdf::Hkdf;
+use ml_dsa::{
+    B32, EncodedSignature, EncodedVerifyingKey, Keypair, MlDsa65, Signature, SigningKey, Verifier,
+    VerifyingKey,
+};
 use ml_kem::kem::{Decapsulate, Encapsulate, KeyExport};
 use ml_kem::{
-    Ciphertext, DecapsulationKey768, EncapsulationKey768, Kem, MlKem768,
-    kem::Key as KemKey,
+    Ciphertext, DecapsulationKey768, EncapsulationKey768, Kem, MlKem768, kem::Key as KemKey,
 };
 use sha2::{Digest, Sha256};
 use x25519_dalek::{PublicKey, StaticSecret};
 
-/// Length of an X25519 public key / shared secret, in bytes.
+/// Length of an X25519 public key, in bytes.
 const X25519_LEN: usize = 32;
+/// Encoded length of an ML-KEM-768 encapsulation key (FIPS 203).
+const MLKEM_EK_LEN: usize = 1184;
+/// Encoded length of an ML-KEM-768 ciphertext (FIPS 203).
+const MLKEM_CT_LEN: usize = 1088;
+/// Encoded length of an ML-DSA-65 verifying (public) key (FIPS 204).
+const MLDSA_VK_LEN: usize = 1952;
+/// Encoded length of an ML-DSA-65 signature (FIPS 204).
+const MLDSA_SIG_LEN: usize = 3309;
 
 /// HKDF `info` domain-separation prefix. Bumped whenever the wire format changes.
 const HKDF_INFO_PREFIX: &[u8] = b"kiss-chat/0 e2e session";
+/// Domain separator for the transcript digest that both peers sign.
+const SIG_CONTEXT: &[u8] = b"kiss-chat/0 handshake signature";
+/// Domain separator for the safety-number derivation.
+const SN_CONTEXT: &[u8] = b"kiss-chat/0 safety number";
 
 /// Nonce direction tag for initiator -> responder traffic.
 const DIR_I2R: [u8; 4] = [0, 0, 0, 1];
@@ -44,27 +73,68 @@ pub enum Role {
     Responder,
 }
 
-/// State the initiator must hold between sending msg1 and receiving msg2.
+/// A long-term ML-DSA-65 identity used to authenticate the handshake.
+///
+/// Built deterministically from a persistent 32-byte seed (see [`crate::identity`]),
+/// so the same seed always yields the same public identity.
+pub struct SigningIdentity {
+    signing_key: SigningKey<MlDsa65>,
+    verifying_key: Vec<u8>,
+}
+
+impl SigningIdentity {
+    /// Derive the identity from its 32-byte seed.
+    pub fn from_seed(seed: &[u8; 32]) -> Self {
+        let signing_key = SigningKey::<MlDsa65>::from_seed(&B32::from(*seed));
+        let verifying_key = signing_key.verifying_key().encode().to_vec();
+        Self {
+            signing_key,
+            verifying_key,
+        }
+    }
+
+    /// Our ML-DSA verifying (public) key, as sent on the wire.
+    pub fn public_bytes(&self) -> &[u8] {
+        &self.verifying_key
+    }
+
+    /// Sign a transcript digest, returning the encoded signature bytes.
+    ///
+    /// Deterministic signing keeps us independent of an RNG and is safe here: the
+    /// digest already commits to fresh ephemeral keys, so signatures never repeat.
+    fn sign(&self, digest: &[u8; 32]) -> Vec<u8> {
+        self.signing_key
+            .expanded_key()
+            .sign_deterministic(digest, &[])
+            .expect("ML-DSA signing of a fixed-size digest never fails")
+            .encode()
+            .to_vec()
+    }
+}
+
+/// State the initiator holds between sending msg1 and receiving msg2.
 pub struct Initiator {
     dk: DecapsulationKey768,
     x_secret: StaticSecret,
+    identity: SigningIdentity,
+    /// msg1 == the initiator's transcript contribution (`ek || x_pub || vk_I`).
     msg1: Vec<u8>,
 }
 
 /// Build the initiator's first handshake message.
-///
-/// Returns the in-flight [`Initiator`] state and `msg1 = ek_pq || x25519_pub`.
-pub fn initiator_start() -> Initiator {
+pub fn initiator_start(identity: SigningIdentity) -> Initiator {
     let (dk, ek) = MlKem768::generate_keypair();
     let x_secret = StaticSecret::from(rand::random::<[u8; 32]>());
     let x_pub = PublicKey::from(&x_secret);
 
     let mut msg1 = ek.to_bytes().to_vec();
     msg1.extend_from_slice(x_pub.as_bytes());
+    msg1.extend_from_slice(identity.public_bytes());
 
     Initiator {
         dk,
         x_secret,
+        identity,
         msg1,
     }
 }
@@ -75,7 +145,8 @@ impl Initiator {
         &self.msg1
     }
 
-    /// Consume msg2 from the responder and derive the [`Session`].
+    /// Consume msg2, verify the responder's signature, and produce the [`Session`]
+    /// plus msg3 (our own signature over the transcript).
     ///
     /// `initiator_id` is our own iroh EndpointId, `responder_id` the peer's.
     pub fn finish(
@@ -83,128 +154,229 @@ impl Initiator {
         msg2: &[u8],
         initiator_id: &[u8; 32],
         responder_id: &[u8; 32],
-    ) -> Result<Session> {
-        let (ct_bytes, their_x_pub) = split_tail(msg2)?;
+    ) -> Result<(Session, Vec<u8>)> {
+        // msg2 = ml_kem_ct || x25519_pub || ml_dsa_vk_R || sig_R
+        let (ct_bytes, rest) = take(msg2, MLKEM_CT_LEN, "ML-KEM ciphertext")?;
+        let (their_x, rest) = take(rest, X25519_LEN, "responder X25519 key")?;
+        let (responder_vk, sig_r) = take(rest, MLDSA_VK_LEN, "responder identity key")?;
+        ensure!(
+            sig_r.len() == MLDSA_SIG_LEN,
+            "responder signature wrong length: {} bytes",
+            sig_r.len()
+        );
+
         let ct = Ciphertext::<MlKem768>::try_from(ct_bytes)
-            .map_err(|_| anyhow::anyhow!("malformed ML-KEM ciphertext"))?;
+            .map_err(|_| anyhow!("malformed ML-KEM ciphertext"))?;
         let ss_kem = self.dk.decapsulate(&ct);
+        let ss_dh = self.x_secret.diffie_hellman(&x25519_public(their_x)?);
 
-        let ss_dh = self
-            .x_secret
-            .diffie_hellman(&PublicKey::from(their_x_pub));
-
-        let key = derive_key(
-            ss_kem.as_slice(),
-            ss_dh.as_bytes(),
-            &self.msg1,
-            msg2,
+        // msg2's transcript contribution excludes the signature that signs it.
+        let msg2_core_len = MLKEM_CT_LEN + X25519_LEN + MLDSA_VK_LEN;
+        let transcript = transcript(
             initiator_id,
             responder_id,
+            &self.msg1,
+            &msg2[..msg2_core_len],
         );
-        Ok(Session::new(key, Role::Initiator))
+        let digest = signing_digest(&transcript);
+
+        verify_signature(responder_vk, &digest, sig_r)?;
+
+        let key = derive_key(ss_kem.as_slice(), ss_dh.as_bytes(), &transcript);
+        let safety = safety_number(self.identity.public_bytes(), responder_vk);
+        let sig_i = self.identity.sign(&digest);
+        Ok((Session::new(key, Role::Initiator, safety), sig_i))
     }
 }
 
-/// Handle the initiator's msg1 and produce our reply plus the [`Session`].
-///
-/// Returns `(session, msg2)` where `msg2 = kem_ciphertext || x25519_pub`.
-pub fn responder_respond(
+/// The responder's state after replying with msg2, awaiting the initiator's
+/// signature (msg3) before the [`Session`] can be trusted.
+pub struct PendingResponder {
+    session: Session,
+    initiator_vk: Vec<u8>,
+    digest: [u8; 32],
+}
+
+/// Handle the initiator's msg1: derive the shared secret, sign the transcript, and
+/// return our reply (msg2) together with a [`PendingResponder`] awaiting msg3.
+pub fn responder_receive(
     msg1: &[u8],
     initiator_id: &[u8; 32],
     responder_id: &[u8; 32],
-) -> Result<(Session, Vec<u8>)> {
-    let (ek_bytes, their_x_pub) = split_tail(msg1)?;
+    identity: SigningIdentity,
+) -> Result<(PendingResponder, Vec<u8>)> {
+    // msg1 = ml_kem_ek || x25519_pub || ml_dsa_vk_I
+    let (ek_bytes, rest) = take(msg1, MLKEM_EK_LEN, "ML-KEM encapsulation key")?;
+    let (their_x, initiator_vk) = take(rest, X25519_LEN, "initiator X25519 key")?;
+    ensure!(
+        initiator_vk.len() == MLDSA_VK_LEN,
+        "initiator identity key wrong length: {} bytes",
+        initiator_vk.len()
+    );
 
     let ek_key = KemKey::<EncapsulationKey768>::try_from(ek_bytes)
-        .map_err(|_| anyhow::anyhow!("malformed ML-KEM encapsulation key"))?;
+        .map_err(|_| anyhow!("malformed ML-KEM encapsulation key"))?;
     let ek = EncapsulationKey768::new(&ek_key)
-        .map_err(|_| anyhow::anyhow!("invalid ML-KEM encapsulation key"))?;
+        .map_err(|_| anyhow!("invalid ML-KEM encapsulation key"))?;
     let (ct, ss_kem) = ek.encapsulate();
 
     let x_secret = StaticSecret::from(rand::random::<[u8; 32]>());
     let x_pub = PublicKey::from(&x_secret);
-    let ss_dh = x_secret.diffie_hellman(&PublicKey::from(their_x_pub));
+    let ss_dh = x_secret.diffie_hellman(&x25519_public(their_x)?);
 
-    let mut msg2 = ct.as_slice().to_vec();
-    msg2.extend_from_slice(x_pub.as_bytes());
+    let mut msg2_core = ct.as_slice().to_vec();
+    msg2_core.extend_from_slice(x_pub.as_bytes());
+    msg2_core.extend_from_slice(identity.public_bytes());
 
-    let key = derive_key(
-        ss_kem.as_slice(),
-        ss_dh.as_bytes(),
-        msg1,
-        &msg2,
-        initiator_id,
-        responder_id,
-    );
-    Ok((Session::new(key, Role::Responder), msg2))
+    let transcript = transcript(initiator_id, responder_id, msg1, &msg2_core);
+    let digest = signing_digest(&transcript);
+
+    let key = derive_key(ss_kem.as_slice(), ss_dh.as_bytes(), &transcript);
+    let safety = safety_number(initiator_vk, identity.public_bytes());
+    let session = Session::new(key, Role::Responder, safety);
+
+    let mut msg2 = msg2_core;
+    msg2.extend_from_slice(&identity.sign(&digest));
+
+    let pending = PendingResponder {
+        session,
+        initiator_vk: initiator_vk.to_vec(),
+        digest,
+    };
+    Ok((pending, msg2))
 }
 
-/// Split a handshake message into `(head, trailing_32_byte_x25519_pubkey)`.
-fn split_tail(msg: &[u8]) -> Result<(&[u8], [u8; 32])> {
+impl PendingResponder {
+    /// Verify the initiator's signature (msg3) and hand back the trusted [`Session`].
+    pub fn finish(self, msg3: &[u8]) -> Result<Session> {
+        ensure!(
+            msg3.len() == MLDSA_SIG_LEN,
+            "initiator signature wrong length: {} bytes",
+            msg3.len()
+        );
+        verify_signature(&self.initiator_vk, &self.digest, msg3)?;
+        Ok(self.session)
+    }
+}
+
+/// Split `n` bytes off the front of `buf`, erroring (with `what`) if it is too short.
+fn take<'a>(buf: &'a [u8], n: usize, what: &str) -> Result<(&'a [u8], &'a [u8])> {
     ensure!(
-        msg.len() > X25519_LEN,
-        "handshake message too short: {} bytes",
-        msg.len()
+        buf.len() >= n,
+        "handshake message truncated: need {n} bytes for {what}, have {}",
+        buf.len()
     );
-    let (head, tail) = msg.split_at(msg.len() - X25519_LEN);
-    let mut pk = [0u8; X25519_LEN];
-    pk.copy_from_slice(tail);
-    Ok((head, pk))
+    Ok(buf.split_at(n))
+}
+
+/// Reconstruct an X25519 public key from exactly 32 bytes.
+fn x25519_public(bytes: &[u8]) -> Result<PublicKey> {
+    let array: [u8; 32] = bytes
+        .try_into()
+        .map_err(|_| anyhow!("X25519 public key must be 32 bytes"))?;
+    Ok(PublicKey::from(array))
+}
+
+/// Verify an ML-DSA signature `sig` over `digest` against the encoded `vk`.
+fn verify_signature(vk: &[u8], digest: &[u8; 32], sig: &[u8]) -> Result<()> {
+    let vk_enc = EncodedVerifyingKey::<MlDsa65>::try_from(vk)
+        .map_err(|_| anyhow!("malformed ML-DSA key"))?;
+    let verifying_key = VerifyingKey::<MlDsa65>::decode(&vk_enc);
+    let sig_enc = EncodedSignature::<MlDsa65>::try_from(sig)
+        .map_err(|_| anyhow!("malformed ML-DSA signature"))?;
+    let signature = Signature::<MlDsa65>::decode(&sig_enc)
+        .ok_or_else(|| anyhow!("invalid ML-DSA signature"))?;
+    verifying_key
+        .verify(digest, &signature)
+        .map_err(|_| anyhow!("handshake authentication failed: signature did not verify"))
+}
+
+/// The transcript both peers sign and salt the session key with:
+/// both iroh identities followed by each side's key contribution.
+fn transcript(
+    initiator_id: &[u8; 32],
+    responder_id: &[u8; 32],
+    msg1_core: &[u8],
+    msg2_core: &[u8],
+) -> Vec<u8> {
+    let mut t = Vec::with_capacity(64 + msg1_core.len() + msg2_core.len());
+    t.extend_from_slice(initiator_id);
+    t.extend_from_slice(responder_id);
+    t.extend_from_slice(msg1_core);
+    t.extend_from_slice(msg2_core);
+    t
+}
+
+/// The 32-byte digest that each peer signs (domain-separated from other hashes).
+fn signing_digest(transcript: &[u8]) -> [u8; 32] {
+    Sha256::new()
+        .chain_update(SIG_CONTEXT)
+        .chain_update(transcript)
+        .finalize()
+        .into()
 }
 
 /// Fold both shared secrets into a single 32-byte session key.
 ///
-/// `ikm = ss_kem || ss_dh` (hybrid), `salt = SHA256(msg1 || msg2)` (transcript
-/// binding), and `info` binds the key to both peers' identities.
-fn derive_key(
-    ss_kem: &[u8],
-    ss_dh: &[u8; 32],
-    msg1: &[u8],
-    msg2: &[u8],
-    initiator_id: &[u8; 32],
-    responder_id: &[u8; 32],
-) -> [u8; 32] {
+/// `ikm = ss_kem || ss_dh` (hybrid), `salt = SHA256(transcript)` (binds identities,
+/// iroh IDs, and both ephemeral keys), and `info` domain-separates the output.
+fn derive_key(ss_kem: &[u8], ss_dh: &[u8; 32], transcript: &[u8]) -> [u8; 32] {
     let mut ikm = Vec::with_capacity(ss_kem.len() + X25519_LEN);
     ikm.extend_from_slice(ss_kem);
     ikm.extend_from_slice(ss_dh);
 
-    let salt = Sha256::new().chain_update(msg1).chain_update(msg2).finalize();
-
-    let mut info = Vec::with_capacity(HKDF_INFO_PREFIX.len() + 64);
-    info.extend_from_slice(HKDF_INFO_PREFIX);
-    info.extend_from_slice(initiator_id);
-    info.extend_from_slice(responder_id);
-
+    let salt = Sha256::digest(transcript);
     let hk = Hkdf::<Sha256>::new(Some(salt.as_slice()), &ikm);
     let mut key = [0u8; 32];
-    hk.expand(&info, &mut key)
+    hk.expand(HKDF_INFO_PREFIX, &mut key)
         .expect("HKDF expand of 32 bytes never fails");
     key
 }
 
-/// An established, quantum-resistant session over which messages are sealed.
+/// A short, order-independent fingerprint of both peers' identity keys, for
+/// out-of-band verification. Both ends compute the same value.
+fn safety_number(vk_a: &[u8], vk_b: &[u8]) -> String {
+    // Sort so the value is symmetric regardless of who dialed whom.
+    let (lo, hi) = if vk_a <= vk_b {
+        (vk_a, vk_b)
+    } else {
+        (vk_b, vk_a)
+    };
+    let digest = Sha256::new()
+        .chain_update(SN_CONTEXT)
+        .chain_update(lo)
+        .chain_update(hi)
+        .finalize();
+    digest[..8]
+        .chunks(2)
+        .map(|pair| format!("{:02x}{:02x}", pair[0], pair[1]))
+        .collect::<Vec<_>>()
+        .join("-")
+}
+
+/// An established, authenticated, quantum-resistant session.
 ///
 /// Splits into a [`Sealer`] (outgoing) and [`Opener`] (incoming) so the read and
 /// write halves can run on independent tasks without sharing mutable state.
 pub struct Session {
     key: [u8; 32],
     role: Role,
+    safety_number: String,
 }
 
 impl Session {
-    fn new(key: [u8; 32], role: Role) -> Self {
-        Self { key, role }
+    fn new(key: [u8; 32], role: Role, safety_number: String) -> Self {
+        Self {
+            key,
+            role,
+            safety_number,
+        }
     }
 
-    /// A short human-comparable fingerprint of the session key, for optional
-    /// out-of-band verification against a MITM. Both peers see the same value.
-    pub fn fingerprint(&self) -> String {
-        let digest = Sha256::digest(self.key);
-        digest[..4]
-            .iter()
-            .map(|b| format!("{b:02x}"))
-            .collect::<Vec<_>>()
-            .join("-")
+    /// The out-of-band verification string derived from both identity keys.
+    /// Identical on both ends when the channel is genuine.
+    pub fn safety_number(&self) -> &str {
+        &self.safety_number
     }
 
     /// Split into directional halves. The direction tags depend on our role so
@@ -252,10 +424,10 @@ impl Sealer {
         self.counter = self
             .counter
             .checked_add(1)
-            .ok_or_else(|| anyhow::anyhow!("send nonce counter exhausted"))?;
+            .ok_or_else(|| anyhow!("send nonce counter exhausted"))?;
         self.cipher
             .encrypt(&Nonce::from(nonce), plaintext)
-            .map_err(|_| anyhow::anyhow!("encryption failed"))
+            .map_err(|_| anyhow!("encryption failed"))
     }
 }
 
@@ -276,11 +448,11 @@ impl Opener {
         let plaintext = self
             .cipher
             .decrypt(&Nonce::from(nonce), ciphertext)
-            .map_err(|_| anyhow::anyhow!("decryption/authentication failed"))?;
+            .map_err(|_| anyhow!("decryption/authentication failed"))?;
         self.counter = self
             .counter
             .checked_add(1)
-            .ok_or_else(|| anyhow::anyhow!("recv nonce counter exhausted"))?;
+            .ok_or_else(|| anyhow!("recv nonce counter exhausted"))?;
         Ok(plaintext)
     }
 }
@@ -289,23 +461,54 @@ impl Opener {
 mod tests {
     use super::*;
 
-    // Run a full handshake in-process and return both established sessions.
-    fn handshake() -> (Session, Session) {
-        let id_a = [0xAAu8; 32]; // initiator id
-        let id_b = [0xBBu8; 32]; // responder id
+    fn identity(seed: u8) -> SigningIdentity {
+        SigningIdentity::from_seed(&[seed; 32])
+    }
 
-        let initiator = initiator_start();
-        let (responder_session, msg2) =
-            responder_respond(initiator.msg1(), &id_a, &id_b).expect("responder");
-        let initiator_session = initiator.finish(&msg2, &id_a, &id_b).expect("initiator");
-        (initiator_session, responder_session)
+    // Run a full three-message handshake in-process and return both sessions.
+    fn handshake() -> (Session, Session) {
+        run_handshake(&[0xAA; 32], &[0xBB; 32], &[0xAA; 32], &[0xBB; 32])
+            .expect("handshake should succeed")
+    }
+
+    // Run a handshake letting each side use its own view of the two iroh IDs, so
+    // tests can simulate an identity splice. Returns an error if authentication fails.
+    fn run_handshake(
+        init_id_i: &[u8; 32],
+        init_id_r: &[u8; 32],
+        resp_id_i: &[u8; 32],
+        resp_id_r: &[u8; 32],
+    ) -> Result<(Session, Session)> {
+        let initiator = initiator_start(identity(1));
+        let (pending, msg2) =
+            responder_receive(initiator.msg1(), resp_id_i, resp_id_r, identity(2))?;
+        let (init_session, msg3) = initiator.finish(&msg2, init_id_i, init_id_r)?;
+        let resp_session = pending.finish(&msg3)?;
+        Ok((init_session, resp_session))
     }
 
     #[test]
-    fn both_sides_derive_the_same_key() {
+    fn wire_lengths_match_the_declared_constants() {
+        // If a crate ever changes an encoding size, our field parsing would silently
+        // misalign — this catches it.
+        let initiator = initiator_start(identity(1));
+        assert_eq!(
+            initiator.msg1().len(),
+            MLKEM_EK_LEN + X25519_LEN + MLDSA_VK_LEN
+        );
+        let (_pending, msg2) =
+            responder_receive(initiator.msg1(), &[1; 32], &[2; 32], identity(2)).unwrap();
+        assert_eq!(
+            msg2.len(),
+            MLKEM_CT_LEN + X25519_LEN + MLDSA_VK_LEN + MLDSA_SIG_LEN
+        );
+    }
+
+    #[test]
+    fn both_sides_derive_the_same_key_and_safety_number() {
         let (a, b) = handshake();
         assert_eq!(a.key, b.key, "session keys must match");
-        assert_eq!(a.fingerprint(), b.fingerprint());
+        assert_eq!(a.safety_number(), b.safety_number());
     }
 
     #[test]
@@ -314,11 +517,9 @@ mod tests {
         let (mut a_seal, mut a_open) = a.split();
         let (mut b_seal, mut b_open) = b.split();
 
-        // initiator -> responder
         let ct = a_seal.seal(b"hello from A").unwrap();
         assert_eq!(b_open.open(&ct).unwrap(), b"hello from A");
 
-        // responder -> initiator
         let ct = b_seal.seal(b"hi back from B").unwrap();
         assert_eq!(a_open.open(&ct).unwrap(), b"hi back from B");
     }
@@ -340,22 +541,60 @@ mod tests {
 
         let mut ct = a_seal.seal(b"trust me").unwrap();
         let last = ct.len() - 1;
-        ct[last] ^= 0x01; // flip a bit in the tag
+        ct[last] ^= 0x01;
         assert!(b_open.open(&ct).is_err(), "AEAD must reject tampering");
     }
 
     #[test]
-    fn mismatched_identities_break_the_handshake() {
-        // If the two sides disagree about who they're talking to (e.g. a MITM
-        // splicing identities), the derived keys diverge and decryption fails.
-        let initiator = initiator_start();
-        let (b, msg2) = responder_respond(initiator.msg1(), &[1u8; 32], &[2u8; 32]).unwrap();
-        let a = initiator.finish(&msg2, &[1u8; 32], &[9u8; 32]).unwrap();
-        assert_ne!(a.key, b.key);
+    fn tampered_responder_signature_is_rejected() {
+        let initiator = initiator_start(identity(1));
+        let (_pending, mut msg2) =
+            responder_receive(initiator.msg1(), &[1; 32], &[2; 32], identity(2)).unwrap();
+        // Flip a byte inside the responder's signature (the trailing field).
+        let last = msg2.len() - 1;
+        msg2[last] ^= 0x01;
+        assert!(
+            initiator.finish(&msg2, &[1; 32], &[2; 32]).is_err(),
+            "initiator must reject a bad responder signature"
+        );
+    }
 
-        let (mut a_seal, _) = a.split();
-        let (_, mut b_open) = b.split();
-        let ct = a_seal.seal(b"secret").unwrap();
-        assert!(b_open.open(&ct).is_err());
+    #[test]
+    fn tampered_initiator_signature_is_rejected() {
+        let initiator = initiator_start(identity(1));
+        let (pending, msg2) =
+            responder_receive(initiator.msg1(), &[1; 32], &[2; 32], identity(2)).unwrap();
+        let (_session, mut msg3) = initiator.finish(&msg2, &[1; 32], &[2; 32]).unwrap();
+        msg3[0] ^= 0x01;
+        assert!(
+            pending.finish(&msg3).is_err(),
+            "responder must reject a bad initiator signature"
+        );
+    }
+
+    #[test]
+    fn mismatched_iroh_ids_break_authentication() {
+        // The two sides disagree about the responder's iroh id (as a MITM splice
+        // would). Their transcripts diverge, so the responder's signature — made over
+        // its own transcript — fails to verify against the initiator's transcript.
+        let result = run_handshake(&[1; 32], &[2; 32], &[1; 32], &[9; 32]);
+        assert!(
+            result.is_err(),
+            "spliced identities must fail the handshake"
+        );
+    }
+
+    #[test]
+    fn a_different_identity_key_changes_the_safety_number() {
+        // A MITM substituting its own identity key would change what each side sees.
+        let (a, _b) = handshake();
+        let mitm = safety_number(identity(1).public_bytes(), identity(3).public_bytes());
+        assert_ne!(a.safety_number(), mitm);
+    }
+
+    #[test]
+    fn the_same_seed_yields_the_same_identity() {
+        assert_eq!(identity(7).public_bytes(), identity(7).public_bytes());
+        assert_ne!(identity(7).public_bytes(), identity(8).public_bytes());
     }
 }

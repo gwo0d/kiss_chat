@@ -6,21 +6,24 @@
 //!
 //! In-app commands (the input line is a command prompt until a peer is connected):
 //!   /connect <peer-id>     dial a peer (switches peers if already connected)
+//!   /accept, /reject       accept or reject a peer after comparing the safety number
 //!   /clear                 clear the screen
 //!   /help                  list commands
 //!   /quit                  exit (also Esc / Ctrl-C)
 //!
 //! Architecture:
+//!   identity   — persistent on-disk keys (iroh address + ML-DSA auth seed)
 //!   transport  — iroh: bind, dial-by-key, accept (handles NAT traversal)
 //!   proto      — length-prefixed framing over the QUIC stream
 //!   message    — the 1-byte-tagged in-band protocol (chat text vs. Bye control)
-//!   crypto     — hybrid X25519 + ML-KEM-768 handshake, then ChaCha20-Poly1305
+//!   crypto     — hybrid X25519 + ML-KEM-768 KEX, ML-DSA-65 auth, ChaCha20-Poly1305
 //!   ui         — ratatui terminal interface (pure state)
 //!   main       — the event loop wiring input, connection tasks, and the UI together
 //!
 //! The dialer is always the crypto *initiator*; the accepter is the *responder*.
 
 mod crypto;
+mod identity;
 mod message;
 mod proto;
 mod transport;
@@ -76,9 +79,10 @@ async fn main() -> Result<()> {
     }
 
     let endpoint = transport::bind().await?;
+    let auth_seed = identity::load_or_create_auth_seed()?;
 
     let mut terminal = ratatui::init();
-    let result = run(&mut terminal, endpoint, peer_arg).await;
+    let result = run(&mut terminal, endpoint, peer_arg, auth_seed).await;
     ratatui::restore();
     result
 }
@@ -89,14 +93,19 @@ fn print_usage() {
          usage:\n\
          \x20 kiss_chat              listen in the lobby; share your address and wait\n\
          \x20 kiss_chat <peer-id>    dial a peer immediately\n\n\
-         inside the app: /connect <peer-id>, /clear, /help, /quit"
+         inside the app: /connect <peer-id>, /accept, /reject, /clear, /help, /quit"
     );
 }
 
 /// The main event loop. Brings up the UI in the lobby, listens for an incoming
 /// peer, and lets the user dial out — driven by three sources: key presses,
 /// connection-attempt results, and decrypted network messages.
-async fn run(terminal: &mut DefaultTerminal, endpoint: Endpoint, peer_arg: Option<String>) -> Result<()> {
+async fn run(
+    terminal: &mut DefaultTerminal,
+    endpoint: Endpoint,
+    peer_arg: Option<String>,
+    auth_seed: [u8; 32],
+) -> Result<()> {
     let my_id = endpoint.id();
     let mut app = App::new(my_id.to_string());
 
@@ -117,14 +126,14 @@ async fn run(terminal: &mut DefaultTerminal, endpoint: Endpoint, peer_arg: Optio
     let (net_tx, mut net_rx) = mpsc::unbounded_channel::<NetEvent>();
 
     // Listen for an incoming peer whenever we're not in a session.
-    let mut accept_handle = arm_accept(&endpoint, my_id, &conn_tx);
+    let mut accept_handle = arm_accept(&endpoint, my_id, auth_seed, &conn_tx);
 
     // Optional auto-dial from the command line.
     if let Some(arg) = peer_arg {
         match EndpointId::from_str(arg.trim()) {
             Ok(peer) => {
                 app.set_connecting(peer.fmt_short().to_string());
-                spawn_dial(&endpoint, my_id, peer, &conn_tx);
+                spawn_dial(&endpoint, my_id, peer, auth_seed, &conn_tx);
             }
             Err(_) => app.push_system("ignoring invalid peer id from the command line"),
         }
@@ -153,10 +162,19 @@ async fn run(terminal: &mut DefaultTerminal, endpoint: Endpoint, peer_arg: Optio
                                 app.push_system("left the current chat");
                             }
                             app.set_connecting(peer.fmt_short().to_string());
-                            spawn_dial(&endpoint, my_id, peer, &conn_tx);
+                            spawn_dial(&endpoint, my_id, peer, auth_seed, &conn_tx);
                         }
                         Err(_) => app.push_system("invalid peer id"),
                     },
+                    Action::RejectPeer => {
+                        // The safety number didn't match: leave and return to the lobby.
+                        if let Some(old) = session.take() {
+                            old.reader.abort();
+                            tokio::spawn(farewell(old.conn, old.outgoing_tx, old.writer));
+                        }
+                        accept_handle = arm_accept(&endpoint, my_id, auth_seed, &conn_tx);
+                        app.set_lobby("rejected the peer — back in the lobby");
+                    }
                     Action::Send(line) => {
                         if let Some(live) = &session {
                             let _ = live.outgoing_tx.send(Outgoing::Text(line));
@@ -177,7 +195,7 @@ async fn run(terminal: &mut DefaultTerminal, endpoint: Endpoint, peer_arg: Optio
                         // Drop any stale events left over from a previous session.
                         while net_rx.try_recv().is_ok() {}
 
-                        let fingerprint = new_session.fingerprint();
+                        let safety_number = new_session.safety_number().to_string();
                         let (sealer, opener) = new_session.split();
                         let (out_tx, out_rx) = mpsc::unbounded_channel::<Outgoing>();
                         session = Some(LiveSession {
@@ -186,12 +204,14 @@ async fn run(terminal: &mut DefaultTerminal, endpoint: Endpoint, peer_arg: Optio
                             reader: spawn_reader(recv, opener, net_tx.clone()),
                             writer: spawn_writer(send, sealer, out_rx),
                         });
-                        app.set_connected(peer.fmt_short().to_string(), fingerprint);
+                        // The channel is up, but hold chat until the user has compared
+                        // the safety number out-of-band and accepted.
+                        app.set_verifying(peer.fmt_short().to_string(), safety_number);
                     }
                 }
                 // Dial/accept failed: return to the lobby and keep listening.
                 Some(ConnResult::Failed(reason)) if session.is_none() => {
-                    accept_handle = arm_accept(&endpoint, my_id, &conn_tx);
+                    accept_handle = arm_accept(&endpoint, my_id, auth_seed, &conn_tx);
                     app.set_lobby(reason);
                 }
                 _ => {}
@@ -206,7 +226,7 @@ async fn run(terminal: &mut DefaultTerminal, endpoint: Endpoint, peer_arg: Optio
                         live.writer.abort();
                         live.conn.close(0u32.into(), b"bye");
                     }
-                    accept_handle = arm_accept(&endpoint, my_id, &conn_tx);
+                    accept_handle = arm_accept(&endpoint, my_id, auth_seed, &conn_tx);
                     app.set_lobby(format!("{reason} — back in the lobby"));
                 }
                 None => {}
@@ -224,13 +244,35 @@ async fn run(terminal: &mut DefaultTerminal, endpoint: Endpoint, peer_arg: Optio
 }
 
 /// Spawn a background task that waits for an incoming peer.
-fn arm_accept(endpoint: &Endpoint, my_id: EndpointId, conn_tx: &UnboundedSender<ConnResult>) -> JoinHandle<()> {
-    tokio::spawn(accept_and_handshake(endpoint.clone(), my_id, conn_tx.clone()))
+fn arm_accept(
+    endpoint: &Endpoint,
+    my_id: EndpointId,
+    auth_seed: [u8; 32],
+    conn_tx: &UnboundedSender<ConnResult>,
+) -> JoinHandle<()> {
+    tokio::spawn(accept_and_handshake(
+        endpoint.clone(),
+        my_id,
+        auth_seed,
+        conn_tx.clone(),
+    ))
 }
 
 /// Spawn a background task that dials a peer.
-fn spawn_dial(endpoint: &Endpoint, my_id: EndpointId, peer: EndpointId, conn_tx: &UnboundedSender<ConnResult>) {
-    tokio::spawn(dial_and_handshake(endpoint.clone(), my_id, peer, conn_tx.clone()));
+fn spawn_dial(
+    endpoint: &Endpoint,
+    my_id: EndpointId,
+    peer: EndpointId,
+    auth_seed: [u8; 32],
+    conn_tx: &UnboundedSender<ConnResult>,
+) {
+    tokio::spawn(dial_and_handshake(
+        endpoint.clone(),
+        my_id,
+        peer,
+        auth_seed,
+        conn_tx.clone(),
+    ));
 }
 
 /// Announce departure to the peer and close down gracefully.
@@ -238,7 +280,11 @@ fn spawn_dial(endpoint: &Endpoint, my_id: EndpointId, peer: EndpointId, conn_tx:
 /// Sends a `Bye` frame, then waits (bounded) for the peer to receive it and close
 /// in response — which both confirms delivery and keeps the connection alive long
 /// enough for the frame to actually reach the wire.
-async fn farewell(conn: Connection, outgoing_tx: UnboundedSender<Outgoing>, writer: JoinHandle<()>) {
+async fn farewell(
+    conn: Connection,
+    outgoing_tx: UnboundedSender<Outgoing>,
+    writer: JoinHandle<()>,
+) {
     let _ = outgoing_tx.send(Outgoing::Bye);
     let _ = tokio::time::timeout(FAREWELL_TIMEOUT, conn.closed()).await;
     writer.abort();
@@ -250,15 +296,24 @@ async fn dial_and_handshake(
     endpoint: Endpoint,
     my_id: EndpointId,
     peer: EndpointId,
+    auth_seed: [u8; 32],
     tx: UnboundedSender<ConnResult>,
 ) {
     let attempt = async {
         let (conn, mut send, mut recv) = transport::dial(&endpoint, peer).await?;
-        let initiator = crypto::initiator_start();
+        let identity = crypto::SigningIdentity::from_seed(&auth_seed);
+        let initiator = crypto::initiator_start(identity);
         proto::write_frame(&mut send, initiator.msg1()).await?;
         let msg2 = proto::read_frame(&mut recv).await?;
-        let session = initiator.finish(&msg2, my_id.as_bytes(), peer.as_bytes())?;
-        anyhow::Ok(Established { conn, send, recv, session, peer })
+        let (session, msg3) = initiator.finish(&msg2, my_id.as_bytes(), peer.as_bytes())?;
+        proto::write_frame(&mut send, &msg3).await?;
+        anyhow::Ok(Established {
+            conn,
+            send,
+            recv,
+            session,
+            peer,
+        })
     };
     let _ = tx.send(match attempt.await {
         Ok(established) => ConnResult::Established(Box::new(established)),
@@ -267,14 +322,29 @@ async fn dial_and_handshake(
 }
 
 /// Wait for an incoming peer and run the responder side of the handshake.
-async fn accept_and_handshake(endpoint: Endpoint, my_id: EndpointId, tx: UnboundedSender<ConnResult>) {
+async fn accept_and_handshake(
+    endpoint: Endpoint,
+    my_id: EndpointId,
+    auth_seed: [u8; 32],
+    tx: UnboundedSender<ConnResult>,
+) {
     let attempt = async {
         let (conn, mut send, mut recv) = transport::accept(&endpoint).await?;
         let peer = conn.remote_id();
+        let identity = crypto::SigningIdentity::from_seed(&auth_seed);
         let msg1 = proto::read_frame(&mut recv).await?;
-        let (session, msg2) = crypto::responder_respond(&msg1, peer.as_bytes(), my_id.as_bytes())?;
+        let (pending, msg2) =
+            crypto::responder_receive(&msg1, peer.as_bytes(), my_id.as_bytes(), identity)?;
         proto::write_frame(&mut send, &msg2).await?;
-        anyhow::Ok(Established { conn, send, recv, session, peer })
+        let msg3 = proto::read_frame(&mut recv).await?;
+        let session = pending.finish(&msg3)?;
+        anyhow::Ok(Established {
+            conn,
+            send,
+            recv,
+            session,
+            peer,
+        })
     };
     let _ = tx.send(match attempt.await {
         Ok(established) => ConnResult::Established(Box::new(established)),
@@ -294,7 +364,9 @@ fn spawn_reader(
                 Ok(ciphertext) => match opener.open(&ciphertext) {
                     Ok(plaintext) => match message::decode(&plaintext) {
                         message::Incoming::Text(text) => NetEvent::Message(text),
-                        message::Incoming::Bye => NetEvent::Disconnected("peer left the chat".into()),
+                        message::Incoming::Bye => {
+                            NetEvent::Disconnected("peer left the chat".into())
+                        }
                         message::Incoming::Malformed => {
                             NetEvent::Disconnected("received a malformed message".into())
                         }

@@ -1,0 +1,211 @@
+//! Persistent, on-disk identity for kiss_chat.
+//!
+//! kiss_chat keeps two long-term secrets, both 32 bytes and stored as hex under
+//! the user's config directory:
+//!
+//!   - the **iroh endpoint secret key** (`secret.key`) — your reachable address,
+//!     the [`EndpointId`] peers dial; and
+//!   - the **ML-DSA authentication seed** (`auth.key`) — your post-quantum signing
+//!     identity, which the handshake uses to prove who you are and which peers
+//!     verify out-of-band via the session *safety number*.
+//!
+//! Both are generated once, on first run, and reused thereafter so your identity
+//! is stable across restarts.
+//!
+//! [`EndpointId`]: iroh::EndpointId
+
+use std::path::{Path, PathBuf};
+
+use anyhow::{Context, Result, ensure};
+use iroh::SecretKey;
+
+/// Filename of the iroh endpoint secret key inside the config directory.
+const ENDPOINT_KEY_FILE: &str = "secret.key";
+/// Filename of the ML-DSA authentication seed inside the config directory.
+const AUTH_SEED_FILE: &str = "auth.key";
+
+/// Load the persistent iroh endpoint key, creating one on first run.
+pub fn load_or_create_endpoint_secret() -> Result<SecretKey> {
+    let bytes = load_or_create_key(&config_dir()?, ENDPOINT_KEY_FILE, || {
+        SecretKey::generate().to_bytes()
+    })?;
+    Ok(SecretKey::from_bytes(&bytes))
+}
+
+/// Load the persistent 32-byte ML-DSA authentication seed, creating one on first run.
+pub fn load_or_create_auth_seed() -> Result<[u8; 32]> {
+    load_or_create_key(&config_dir()?, AUTH_SEED_FILE, rand::random::<[u8; 32]>)
+}
+
+/// Read a 32-byte key from `file` in `dir`, or generate, persist, and return a
+/// fresh one (via `generate`) if the file does not exist yet.
+fn load_or_create_key(
+    dir: &Path,
+    file: &str,
+    generate: impl FnOnce() -> [u8; 32],
+) -> Result<[u8; 32]> {
+    let path = dir.join(file);
+
+    if path.exists() {
+        let contents = std::fs::read_to_string(&path)
+            .with_context(|| format!("failed to read key at {}", path.display()))?;
+        return decode_hex(&contents)
+            .with_context(|| format!("malformed key at {}", path.display()));
+    }
+
+    let bytes = generate();
+    std::fs::create_dir_all(dir).with_context(|| format!("failed to create {}", dir.display()))?;
+    write_secret(&path, &bytes)
+        .with_context(|| format!("failed to write key to {}", path.display()))?;
+    Ok(bytes)
+}
+
+/// The directory holding kiss_chat's keys: `$XDG_CONFIG_HOME/kiss_chat`, or
+/// `$HOME/.config/kiss_chat` when `XDG_CONFIG_HOME` is unset.
+fn config_dir() -> Result<PathBuf> {
+    let base = if let Some(xdg) = std::env::var_os("XDG_CONFIG_HOME") {
+        PathBuf::from(xdg)
+    } else {
+        let home = std::env::var_os("HOME")
+            .context("cannot locate config directory: neither XDG_CONFIG_HOME nor HOME is set")?;
+        PathBuf::from(home).join(".config")
+    };
+    Ok(base.join("kiss_chat"))
+}
+
+/// Write 32 secret bytes as hex, restricted to owner-only on unix.
+fn write_secret(path: &Path, bytes: &[u8; 32]) -> Result<()> {
+    let hex = encode_hex(bytes);
+    #[cfg(unix)]
+    {
+        use std::io::Write;
+        use std::os::unix::fs::OpenOptionsExt;
+        // Create with mode 0600 up front so the key is never briefly world-readable.
+        let mut file = std::fs::OpenOptions::new()
+            .write(true)
+            .create(true)
+            .truncate(true)
+            .mode(0o600)
+            .open(path)?;
+        file.write_all(hex.as_bytes())?;
+    }
+    #[cfg(not(unix))]
+    {
+        std::fs::write(path, hex)?;
+    }
+    Ok(())
+}
+
+/// Encode 32 bytes as a 64-character lowercase hex string.
+fn encode_hex(bytes: &[u8; 32]) -> String {
+    use std::fmt::Write;
+    bytes.iter().fold(String::with_capacity(64), |mut s, b| {
+        let _ = write!(s, "{b:02x}");
+        s
+    })
+}
+
+/// Decode a 64-character hex string (with optional surrounding whitespace) into 32 bytes.
+fn decode_hex(text: &str) -> Result<[u8; 32]> {
+    let text = text.trim();
+    ensure!(
+        text.len() == 64,
+        "expected 64 hex characters, got {}",
+        text.len()
+    );
+    let mut bytes = [0u8; 32];
+    for (i, byte) in bytes.iter_mut().enumerate() {
+        *byte = u8::from_str_radix(&text[i * 2..i * 2 + 2], 16)
+            .context("key contains non-hex characters")?;
+    }
+    Ok(bytes)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn hex_round_trips() {
+        let bytes: [u8; 32] = std::array::from_fn(|i| i as u8);
+        let encoded = encode_hex(&bytes);
+        assert_eq!(encoded.len(), 64);
+        assert_eq!(decode_hex(&encoded).unwrap(), bytes);
+    }
+
+    #[test]
+    fn decode_hex_tolerates_surrounding_whitespace() {
+        let encoded = encode_hex(&[0xAB; 32]);
+        assert_eq!(decode_hex(&format!("\n  {encoded}\n")).unwrap(), [0xAB; 32]);
+    }
+
+    #[test]
+    fn decode_hex_rejects_wrong_length() {
+        assert!(decode_hex("abcd").is_err());
+    }
+
+    #[test]
+    fn decode_hex_rejects_non_hex() {
+        assert!(decode_hex(&"z".repeat(64)).is_err());
+    }
+
+    // A throwaway directory under the system temp dir, removed on drop.
+    struct TempDir(PathBuf);
+
+    impl TempDir {
+        fn new() -> Self {
+            let nanos = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos();
+            let dir =
+                std::env::temp_dir().join(format!("kiss_chat_test_{}_{nanos}", std::process::id()));
+            std::fs::create_dir_all(&dir).unwrap();
+            Self(dir)
+        }
+    }
+
+    impl Drop for TempDir {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+
+    #[test]
+    fn key_is_created_then_reloaded_unchanged() {
+        let dir = TempDir::new();
+        let first = load_or_create_key(&dir.0, "k.key", || [0x11; 32]).unwrap();
+        assert_eq!(
+            first, [0x11; 32],
+            "first call returns the freshly generated key"
+        );
+
+        // Second call must load from disk and ignore the (different) generator.
+        let second = load_or_create_key(&dir.0, "k.key", || [0x22; 32]).unwrap();
+        assert_eq!(second, first, "reload must return the persisted key");
+    }
+
+    #[test]
+    fn a_corrupt_key_file_is_an_error_not_a_silent_reset() {
+        let dir = TempDir::new();
+        std::fs::write(dir.0.join("k.key"), "not hex").unwrap();
+        assert!(load_or_create_key(&dir.0, "k.key", || [0; 32]).is_err());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn persisted_key_is_owner_only() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = TempDir::new();
+        load_or_create_key(&dir.0, "k.key", || [0x11; 32]).unwrap();
+        let mode = std::fs::metadata(dir.0.join("k.key"))
+            .unwrap()
+            .permissions()
+            .mode();
+        assert_eq!(
+            mode & 0o777,
+            0o600,
+            "secret key must be readable only by its owner"
+        );
+    }
+}
