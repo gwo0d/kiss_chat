@@ -7,6 +7,7 @@
 //! In-app commands (the input line is a command prompt until a peer is connected):
 //!   /connect <peer-id>     dial a peer (switches peers if already connected)
 //!   /accept, /reject       accept or reject a peer after comparing the safety number
+//!   /name [text]           set your (optional) display name; only shared after /accept
 //!   /clear                 clear the screen
 //!   /help                  list commands
 //!   /quit                  exit (also Esc / Ctrl-C)
@@ -80,9 +81,12 @@ async fn main() -> Result<()> {
 
     let endpoint = transport::bind().await?;
     let auth_seed = identity::load_or_create_auth_seed()?;
+    // An optional, previously-saved display name. Sanitised so a hand-edited file
+    // can't feed control characters or an over-long name into the session.
+    let display_name = identity::load_display_name()?.and_then(|n| message::sanitize_name(&n));
 
     let mut terminal = ratatui::init();
-    let result = run(&mut terminal, endpoint, peer_arg, auth_seed).await;
+    let result = run(&mut terminal, endpoint, peer_arg, auth_seed, display_name).await;
     ratatui::restore();
     result
 }
@@ -93,7 +97,7 @@ fn print_usage() {
          usage:\n\
          \x20 kiss_chat              listen in the lobby; share your address and wait\n\
          \x20 kiss_chat <peer-id>    dial a peer immediately\n\n\
-         inside the app: /connect <peer-id>, /accept, /reject, /clear, /help, /quit"
+         inside the app: /connect <peer-id>, /accept, /reject, /name, /clear, /help, /quit"
     );
 }
 
@@ -105,9 +109,15 @@ async fn run(
     endpoint: Endpoint,
     peer_arg: Option<String>,
     auth_seed: [u8; 32],
+    display_name: Option<String>,
 ) -> Result<()> {
     let my_id = endpoint.id();
     let mut app = App::new(my_id.to_string());
+
+    // Our own display name (optional) and whether we've accepted the current peer.
+    // We share the name only once accepted — never during the verify step.
+    let mut my_name = display_name;
+    let mut accepted = false;
 
     // Bridge blocking crossterm input into async on a dedicated thread.
     let (input_tx, mut input_rx) = mpsc::unbounded_channel::<KeyEvent>();
@@ -161,19 +171,43 @@ async fn run(
                                 tokio::spawn(farewell(old.conn, old.outgoing_tx, old.writer));
                                 app.push_system("left the current chat");
                             }
+                            accepted = false;
                             app.set_connecting(peer.fmt_short().to_string());
                             spawn_dial(&endpoint, my_id, peer, auth_seed, &conn_tx);
                         }
                         Err(_) => app.push_system("invalid peer id"),
                     },
+                    Action::Accept => {
+                        // Now — and only now — is it safe to share our display name.
+                        accepted = true;
+                        if let (Some(live), Some(name)) = (&session, &my_name) {
+                            let _ = live.outgoing_tx.send(Outgoing::Name(Some(name.clone())));
+                        }
+                    }
                     Action::RejectPeer => {
                         // The safety number didn't match: leave and return to the lobby.
                         if let Some(old) = session.take() {
                             old.reader.abort();
                             tokio::spawn(farewell(old.conn, old.outgoing_tx, old.writer));
                         }
+                        accepted = false;
                         accept_handle = arm_accept(&endpoint, my_id, auth_seed, &conn_tx);
                         app.set_lobby("rejected the peer — back in the lobby");
+                    }
+                    Action::SetName(raw) => {
+                        my_name = message::sanitize_name(&raw);
+                        if let Err(err) = identity::save_display_name(my_name.as_deref()) {
+                            app.push_system(format!("could not save display name: {err}"));
+                        }
+                        match &my_name {
+                            Some(name) => app.push_system(format!("display name set to \"{name}\"")),
+                            None => app.push_system("display name cleared"),
+                        }
+                        // Propagate the change (including a clear) to a peer we're
+                        // already chatting with; otherwise it waits for /accept.
+                        if accepted && let Some(live) = &session {
+                            let _ = live.outgoing_tx.send(Outgoing::Name(my_name.clone()));
+                        }
                     }
                     Action::Send(line) => {
                         if let Some(live) = &session {
@@ -195,6 +229,8 @@ async fn run(
                         // Drop any stale events left over from a previous session.
                         while net_rx.try_recv().is_ok() {}
 
+                        // Fresh channel: not yet accepted, so no name is shared.
+                        accepted = false;
                         let safety_number = new_session.safety_number().to_string();
                         let (sealer, opener) = new_session.split();
                         let (out_tx, out_rx) = mpsc::unbounded_channel::<Outgoing>();
@@ -219,6 +255,7 @@ async fn run(
 
             event = net_rx.recv(), if session.is_some() => match event {
                 Some(NetEvent::Message(text)) => app.push_peer(text),
+                Some(NetEvent::PeerName(name)) => app.set_peer_name(name),
                 Some(NetEvent::Disconnected(reason)) => {
                     // The peer is already gone, so just tear down and re-open the lobby.
                     if let Some(live) = session.take() {
@@ -226,6 +263,7 @@ async fn run(
                         live.writer.abort();
                         live.conn.close(0u32.into(), b"bye");
                     }
+                    accepted = false;
                     accept_handle = arm_accept(&endpoint, my_id, auth_seed, &conn_tx);
                     app.set_lobby(format!("{reason} — back in the lobby"));
                 }
@@ -364,6 +402,7 @@ fn spawn_reader(
                 Ok(ciphertext) => match opener.open(&ciphertext) {
                     Ok(plaintext) => match message::decode(&plaintext) {
                         message::Incoming::Text(text) => NetEvent::Message(text),
+                        message::Incoming::Name(name) => NetEvent::PeerName(name),
                         message::Incoming::Bye => {
                             NetEvent::Disconnected("peer left the chat".into())
                         }

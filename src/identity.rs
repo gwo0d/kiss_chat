@@ -12,6 +12,11 @@
 //! Both are generated once, on first run, and reused thereafter so your identity
 //! is stable across restarts.
 //!
+//! Alongside them sits an optional, non-secret **display name** (`name`): a plain
+//! UTF-8 file holding whatever the user set with `/name`. It is absent until set,
+//! stored world-readable (it's not a secret), and only ever shared with a peer
+//! after a channel is accepted.
+//!
 //! [`EndpointId`]: iroh::EndpointId
 
 use std::path::{Path, PathBuf};
@@ -23,6 +28,8 @@ use iroh::SecretKey;
 const ENDPOINT_KEY_FILE: &str = "secret.key";
 /// Filename of the ML-DSA authentication seed inside the config directory.
 const AUTH_SEED_FILE: &str = "auth.key";
+/// Filename of the optional display name inside the config directory.
+const DISPLAY_NAME_FILE: &str = "name";
 
 /// Load the persistent iroh endpoint key, creating one on first run.
 pub fn load_or_create_endpoint_secret() -> Result<SecretKey> {
@@ -35,6 +42,53 @@ pub fn load_or_create_endpoint_secret() -> Result<SecretKey> {
 /// Load the persistent 32-byte ML-DSA authentication seed, creating one on first run.
 pub fn load_or_create_auth_seed() -> Result<[u8; 32]> {
     load_or_create_key(&config_dir()?, AUTH_SEED_FILE, rand::random::<[u8; 32]>)
+}
+
+/// Load the saved display name, if the user has ever set one.
+///
+/// Returns the raw stored string (trimmed); the caller sanitises it before use.
+/// A missing file is not an error — a display name is optional.
+pub fn load_display_name() -> Result<Option<String>> {
+    load_display_name_in(&config_dir()?)
+}
+
+/// Persist (or, with `None`, remove) the display name.
+pub fn save_display_name(name: Option<&str>) -> Result<()> {
+    save_display_name_in(&config_dir()?, name)
+}
+
+/// Read the display name from `dir`, treating a missing file as "unset".
+fn load_display_name_in(dir: &Path) -> Result<Option<String>> {
+    let path = dir.join(DISPLAY_NAME_FILE);
+    match std::fs::read_to_string(&path) {
+        Ok(contents) => {
+            let trimmed = contents.trim();
+            Ok((!trimmed.is_empty()).then(|| trimmed.to_string()))
+        }
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(err) => {
+            Err(err).with_context(|| format!("failed to read display name at {}", path.display()))
+        }
+    }
+}
+
+/// Write the display name into `dir`, or delete the file when clearing it.
+fn save_display_name_in(dir: &Path, name: Option<&str>) -> Result<()> {
+    let path = dir.join(DISPLAY_NAME_FILE);
+    match name {
+        Some(name) => {
+            std::fs::create_dir_all(dir)
+                .with_context(|| format!("failed to create {}", dir.display()))?;
+            std::fs::write(&path, name)
+                .with_context(|| format!("failed to write display name to {}", path.display()))
+        }
+        None => match std::fs::remove_file(&path) {
+            Ok(()) => Ok(()),
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(()),
+            Err(err) => Err(err)
+                .with_context(|| format!("failed to clear display name at {}", path.display())),
+        },
+    }
 }
 
 /// Read a 32-byte key from `file` in `dir`, or generate, persist, and return a
@@ -190,6 +244,28 @@ mod tests {
         let dir = TempDir::new();
         std::fs::write(dir.0.join("k.key"), "not hex").unwrap();
         assert!(load_or_create_key(&dir.0, "k.key", || [0; 32]).is_err());
+    }
+
+    #[test]
+    fn display_name_is_unset_when_absent() {
+        let dir = TempDir::new();
+        assert_eq!(load_display_name_in(&dir.0).unwrap(), None);
+    }
+
+    #[test]
+    fn display_name_round_trips_and_clears() {
+        let dir = TempDir::new();
+        save_display_name_in(&dir.0, Some("Alice Smith")).unwrap();
+        assert_eq!(
+            load_display_name_in(&dir.0).unwrap().as_deref(),
+            Some("Alice Smith")
+        );
+
+        // Clearing removes the file, so the name reads back as unset.
+        save_display_name_in(&dir.0, None).unwrap();
+        assert_eq!(load_display_name_in(&dir.0).unwrap(), None);
+        // Clearing an already-absent name is not an error.
+        assert!(save_display_name_in(&dir.0, None).is_ok());
     }
 
     #[cfg(unix)]
