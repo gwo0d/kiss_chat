@@ -1,0 +1,15 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512" width="512" height="512">
+  <title>kiss_chat icon (light)</title>
+  <desc>Two overlapping speech bubbles share a kiss-style x mark on a light rounded tile.</desc>
+  <defs>
+    <clipPath id="lensL"><circle cx="195" cy="241" r="138"/></clipPath>
+  </defs>
+  <rect x="10" y="10" width="492" height="492" rx="118" fill="#F6F8FA" stroke="#D0D7DE" stroke-width="4"/>
+  <path d="M 123 353 L 67 440 L 169 374 Z" fill="#3DF08C"/>
+  <circle cx="195" cy="241" r="138" fill="#3DF08C"/>
+  <path d="M 389 353 L 445 440 L 343 374 Z" fill="#2FD4B4"/>
+  <circle cx="317" cy="241" r="138" fill="#2FD4B4"/>
+  <circle cx="317" cy="241" r="138" fill="#D9FBEA" clip-path="url(#lensL)"/>
+  <line x1="223" y1="207" x2="289" y2="274" stroke="#0D1117" stroke-width="31" stroke-linecap="round"/>
+  <line x1="289" y1="207" x2="223" y2="274" stroke="#0D1117" stroke-width="31" stroke-linecap="round"/>
+</svg>

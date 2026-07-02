@@ -1,4 +1,12 @@
-# kiss_chat
+<div align="center">
+
+<picture>
+  <source media="(prefers-color-scheme: dark)" srcset="assets/lockup-dark.svg">
+  <source media="(prefers-color-scheme: light)" srcset="assets/lockup-light.svg">
+  <img alt="kiss_chat" src="assets/lockup-light.svg" width="440">
+</picture>
+
+</div>
 
 A **keep-it-simple** peer-to-peer chat with quantum-resistant end-to-end encryption.
 

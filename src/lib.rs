@@ -1,3 +1,7 @@
+#![doc(
+    html_logo_url = "https://raw.githubusercontent.com/gwo0d/kiss_chat/main/assets/png/icon-256.png",
+    html_favicon_url = "https://raw.githubusercontent.com/gwo0d/kiss_chat/main/assets/png/icon-32.png"
+)]
 //! A keep-it-simple, peer-to-peer chat with quantum-resistant end-to-end encryption.
 //!
 //! Two people, one direct encrypted conversation, no servers to trust.
