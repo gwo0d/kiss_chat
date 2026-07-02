@@ -8,7 +8,7 @@ use anyhow::{Result, ensure};
 use iroh::endpoint::{RecvStream, SendStream};
 
 /// Maximum accepted frame size. The largest legitimate frame is the responder's
-/// handshake message (ML-KEM ciphertext + ML-DSA key + signature, ~6.4 KiB); chat
+/// handshake message (ML-KEM ciphertext + ML-DSA key + signature, ~8.6 KiB); chat
 /// lines are tiny. 64 KiB is comfortably above both and caps how much a peer can
 /// make us allocate from a single length prefix.
 const MAX_FRAME: usize = 64 * 1024;
