@@ -16,7 +16,7 @@
 //!   transport  — iroh: bind, dial-by-key, accept (handles NAT traversal)
 //!   proto      — length-prefixed framing over the QUIC stream
 //!   message    — the 1-byte-tagged in-band protocol (chat text vs. Bye control)
-//!   crypto     — hybrid X25519 + ML-KEM-768 KEX, ML-DSA-65 auth, ChaCha20-Poly1305
+//!   crypto     — hybrid X25519 + ML-KEM-1024 KEX, ML-DSA-87 auth, ChaCha20-Poly1305
 //!   ui         — ratatui terminal interface (pure state)
 //!   main       — the event loop wiring input, connection tasks, and the UI together
 //!
