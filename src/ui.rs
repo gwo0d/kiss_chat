@@ -27,6 +27,8 @@ const SCROLL_STEP: usize = 5;
 pub enum NetEvent {
     /// A decrypted message from the peer.
     Message(String),
+    /// The peer shared (or, with `None`, cleared) their display name.
+    PeerName(Option<String>),
     /// The session ended; carries a human-readable reason.
     Disconnected(String),
 }
@@ -39,10 +41,14 @@ pub enum Action {
     Quit,
     /// Dial the given peer id (from `/connect`).
     Connect(String),
+    /// Accept the peer being verified and begin chatting (from `/accept`).
+    Accept,
     /// Reject the peer being verified and return to the lobby (from `/reject`).
     RejectPeer,
     /// Send the given line to the connected peer.
     Send(String),
+    /// Set (or, with an empty string, clear) our own display name (from `/name`).
+    SetName(String),
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -77,6 +83,8 @@ pub struct App {
     /// Short peer id and safety number of the session under verification / in use.
     peer_short: String,
     safety_number: String,
+    /// The peer's chosen display name, once they share it (only after accepting).
+    peer_name: Option<String>,
     /// Our own address, kept so `/address` can recall it after `/clear`.
     my_address: String,
     pub should_quit: bool,
@@ -94,6 +102,7 @@ impl App {
             scroll_lines: 0,
             peer_short: String::new(),
             safety_number: String::new(),
+            peer_name: None,
             my_address: my_address.clone(),
             should_quit: false,
         };
@@ -134,10 +143,13 @@ impl App {
         self.mode = Mode::Verifying;
         self.peer_short = peer_short;
         self.safety_number = safety_number.clone();
+        // A display name from a previous peer must not leak into this session.
+        self.peer_name = None;
         self.status = format!("verify {} · safety {}", self.peer_short, safety_number);
         self.push_system("channel up — now verify you're talking to the right person:");
         self.push_system(format!("  safety number:  {safety_number}"));
         self.push_system("compare it with your peer over a trusted channel (say it aloud, etc.).");
+        self.push_system("names aren't shared yet — the safety number is what you trust.");
         self.push_system("  /accept   the numbers match — start chatting");
         self.push_system("  /reject   they differ — disconnect");
     }
@@ -145,11 +157,38 @@ impl App {
     /// Transition from verifying to an active chat once the user accepts.
     fn mark_connected(&mut self) {
         self.mode = Mode::Connected;
-        self.status = format!(
-            "connected to {} · safety {}",
-            self.peer_short, self.safety_number
-        );
+        self.status = self.connected_status();
         self.push_system("verified — type a message and press Enter; /quit to leave.");
+    }
+
+    /// The status-bar text for an active chat, folding in the peer's name if known.
+    fn connected_status(&self) -> String {
+        match &self.peer_name {
+            Some(name) => format!(
+                "connected to {name} ({}) · safety {}",
+                self.peer_short, self.safety_number
+            ),
+            None => format!(
+                "connected to {} · safety {}",
+                self.peer_short, self.safety_number
+            ),
+        }
+    }
+
+    /// Record the display name the peer just shared (or cleared), and note it.
+    ///
+    /// The name is cosmetic only: it changes how the peer's lines are labelled but
+    /// never affects trust, which rests on the already-verified safety number.
+    pub fn set_peer_name(&mut self, name: Option<String>) {
+        self.peer_name = name;
+        let note = match &self.peer_name {
+            Some(name) => format!("peer now goes by \"{name}\""),
+            None => "peer cleared their display name".to_string(),
+        };
+        self.push_system(note);
+        if self.mode == Mode::Connected {
+            self.status = self.connected_status();
+        }
     }
 
     /// Return to the lobby (fresh start, or after a peer disconnects / dial fails).
@@ -158,6 +197,7 @@ impl App {
         self.status = "lobby".into();
         self.peer_short.clear();
         self.safety_number.clear();
+        self.peer_name = None;
         self.push_system(note);
     }
 
@@ -345,10 +385,23 @@ impl App {
             "accept" | "a" => {
                 if self.mode == Mode::Verifying {
                     self.mark_connected();
+                    // The main loop shares our display name (if any) now that we've
+                    // accepted — never before.
+                    Action::Accept
                 } else {
                     self.push_system("nothing to accept right now");
+                    Action::None
                 }
-                Action::None
+            }
+            "name" | "n" => {
+                // Take everything after the command word so names may contain spaces;
+                // an empty argument clears the name. The main loop sanitises, persists,
+                // and (if we're already chatting) shares the result.
+                let raw = command
+                    .split_once(char::is_whitespace)
+                    .map(|(_, rest)| rest.trim().to_string())
+                    .unwrap_or_default();
+                Action::SetName(raw)
             }
             "reject" | "r" => {
                 if self.mode == Mode::Verifying {
@@ -381,6 +434,9 @@ impl App {
                     "  /accept              accept the peer after verifying the safety number",
                 );
                 self.push_system("  /reject              reject the peer being verified");
+                self.push_system(
+                    "  /name [text]         set your display name (empty clears); shared on /accept",
+                );
                 self.push_system("  /address             show your own address to share");
                 self.push_system("  /clear               clear the screen");
                 self.push_system("  /help                show this help");
@@ -408,8 +464,9 @@ impl App {
         let height = inner.height as usize;
 
         let mut wrapped: Vec<Line<'static>> = Vec::new();
+        let peer_name = self.peer_name.as_deref();
         for line in &self.history {
-            wrapped.extend(wrapped_lines(line, width));
+            wrapped.extend(wrapped_lines(line, width, peer_name));
         }
         let total = wrapped.len();
         let max_scroll = total.saturating_sub(height);
@@ -470,10 +527,13 @@ fn timestamp_now() -> String {
 }
 
 /// Render one [`ChatLine`] into one or more display lines, wrapped to `width`.
-fn wrapped_lines(line: &ChatLine, width: usize) -> Vec<Line<'static>> {
-    let (label, color) = match line.author {
+///
+/// `peer_name` is the peer's chosen display name, if known; it labels their lines
+/// in place of the generic "peer".
+fn wrapped_lines(line: &ChatLine, width: usize, peer_name: Option<&str>) -> Vec<Line<'static>> {
+    let (label, color): (&str, Color) = match line.author {
         Author::You => ("you", Color::Cyan),
-        Author::Peer => ("peer", Color::Green),
+        Author::Peer => (peer_name.unwrap_or("peer"), Color::Green),
         Author::System => ("--", Color::DarkGray),
     };
     let time = format!("{} ", line.timestamp);
@@ -566,6 +626,11 @@ mod tests {
     use super::*;
     use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 
+    // Concatenate a rendered line's spans back into plain text for assertions.
+    fn line_text(line: &Line) -> String {
+        line.spans.iter().map(|s| s.content.as_ref()).collect()
+    }
+
     // Type a whole line and press Enter, returning the resulting action.
     fn submit_line(app: &mut App, line: &str) -> Action {
         for ch in line.chars() {
@@ -626,6 +691,61 @@ mod tests {
             submit_line(&mut app, "/reject"),
             Action::RejectPeer
         ));
+    }
+
+    #[test]
+    fn accept_while_verifying_yields_accept_action() {
+        let mut app = App::new("my-addr".into());
+        app.set_verifying("peer".into(), "ab-cd".into());
+        assert!(matches!(submit_line(&mut app, "/accept"), Action::Accept));
+    }
+
+    #[test]
+    fn accept_outside_verifying_does_nothing() {
+        let mut app = App::new("my-addr".into());
+        assert!(matches!(submit_line(&mut app, "/accept"), Action::None));
+    }
+
+    #[test]
+    fn name_command_keeps_spaces_and_reports_the_whole_name() {
+        let mut app = App::new("my-addr".into());
+        match submit_line(&mut app, "/name Alice Smith") {
+            Action::SetName(name) => assert_eq!(name, "Alice Smith"),
+            _ => panic!("expected SetName"),
+        }
+    }
+
+    #[test]
+    fn bare_name_command_clears_the_name() {
+        let mut app = App::new("my-addr".into());
+        match submit_line(&mut app, "/name") {
+            Action::SetName(name) => assert!(name.is_empty()),
+            _ => panic!("expected SetName with an empty argument"),
+        }
+    }
+
+    #[test]
+    fn peer_lines_use_the_display_name_when_known() {
+        let line = ChatLine {
+            author: Author::Peer,
+            text: "hi".into(),
+            timestamp: "12:00".into(),
+        };
+        let named = wrapped_lines(&line, 40, Some("Alice"));
+        assert!(line_text(&named[0]).contains("Alice:"));
+        let anon = wrapped_lines(&line, 40, None);
+        assert!(line_text(&anon[0]).contains("peer:"));
+    }
+
+    #[test]
+    fn peer_name_shows_in_the_connected_status() {
+        let mut app = App::new("my-addr".into());
+        reach_connected(&mut app);
+        app.set_peer_name(Some("Alice".into()));
+        assert!(app.status.contains("Alice"));
+        // Clearing reverts to the plain peer id in the status line.
+        app.set_peer_name(None);
+        assert!(!app.status.contains("Alice"));
     }
 
     #[test]

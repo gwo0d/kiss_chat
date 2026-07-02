@@ -61,7 +61,7 @@ cargo run -- 96aedec725a0104933cfd73a2722b3497b13307100a242ccb47efe9cb1fafa39
 Your keys live in `$XDG_CONFIG_HOME/kiss_chat/` (falling back to `~/.config/kiss_chat/`),
 owner-readable only: `secret.key` is your iroh address and `auth.key` is your ML-DSA
 authentication seed. Delete them to rotate to a fresh identity; copy them to run as the same
-identity on another machine.
+identity on another machine. An optional `name` file (not a secret) holds your display name.
 
 ### Verifying the peer
 
@@ -80,6 +80,7 @@ The input line doubles as a command prompt:
 | `/connect <peer-id>` | dial a peer; if already connected, leaves that peer and switches (alias `/c`) |
 | `/accept` | accept the peer after the safety number matches (alias `/a`) |
 | `/reject` | reject the peer being verified and return to the lobby (alias `/r`) |
+| `/name [text]` | set your optional display name; empty clears it (alias `/n`) |
 | `/clear` | clear the screen |
 | `/help` | list commands (alias `/h`, `/?`) |
 | `/quit` | exit (alias `/q`; also <kbd>Esc</kbd> or <kbd>Ctrl-C</kbd>) |
@@ -90,6 +91,15 @@ Editing keys: <kbd>←</kbd>/<kbd>→</kbd>, <kbd>Home</kbd>/<kbd>End</kbd>, <kb
 
 Once accepted, both sides get the same chat view — type a line and press <kbd>Enter</kbd> to send.
 The status bar shows the peer and the session **safety number**. Message timestamps are in UTC.
+
+### Display names
+
+You can set an optional display name with `/name <text>` (`/name` alone clears it). It's purely
+cosmetic and self-asserted, so it is deliberately **never** part of verification: the safety number
+stays your only trust anchor. A name is shared with a peer only *after* you `/accept` them, and it
+travels inside the same end-to-end-encrypted, authenticated frames as your chat messages — never in
+the clear and never during the verify step. Received names are sanitised (control characters
+stripped, length capped) before display. Your name persists across runs in the `name` file.
 
 When you leave — by quitting, or by `/connect`-ing to someone else — kiss_chat sends the peer a
 goodbye so they see a clean "peer left the chat" notice rather than a stalled connection. Either
