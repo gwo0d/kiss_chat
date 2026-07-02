@@ -108,11 +108,11 @@ side dropping returns you to the lobby, where you can `/connect` to someone new.
 ## How it works
 
 ```
-┌──────────────┐   your typed lines    ┌──────────────────────────┐
-│   UI task    │ ────────────────────► │        Net tasks         │
-│  (ratatui)   │                       │  iroh QUIC + AEAD session │
-│              │ ◄──────────────────── │                          │
-└──────────────┘   decrypted messages  └──────────────────────────┘
+┌──────────────┐   your typed lines    ┌────────────────────────────┐
+│   UI task    │ ────────────────────► │        Net tasks           │
+│  (ratatui)   │                       │  iroh QUIC + AEAD session  │
+│              │ ◄──────────────────── │                            │
+└──────────────┘   decrypted messages  └────────────────────────────┘
 ```
 
 | Module | Responsibility |
