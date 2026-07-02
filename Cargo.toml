@@ -4,7 +4,7 @@ description = "A quantum-resistant, naïvely implemented, end-to-end encryption 
 version = "0.1.0"
 edition = "2024"
 authors = ["George O. Wood <git@gwood.dev>"]
-license-file = "LICENSE.md"
+license = "GPL-3.0-or-later"
 
 [profile.release]
 opt-level = 3

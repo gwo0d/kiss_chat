@@ -49,6 +49,13 @@ use crate::ui::{Action, App, NetEvent};
 /// How long to wait for a peer to acknowledge our goodbye before closing anyway.
 const FAREWELL_TIMEOUT: Duration = Duration::from_secs(1);
 
+/// How long a dial or an accepted connection may spend completing the handshake
+/// before we give up. This bounds two things: a dial to an unresponsive peer (so
+/// the UI can't get stuck in "connecting…" with no way back to the lobby) and a
+/// peer that connects but then stalls mid-handshake (so it can't tie up the
+/// listener indefinitely). It does not cover the idle wait for a peer to appear.
+const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(30);
+
 /// Capacity of the decrypted-network-event queue. Bounding it applies backpressure
 /// to the reader task — and, through it, to the QUIC stream's own flow control — so
 /// a peer flooding messages faster than the UI can render them can't grow this
@@ -67,7 +74,13 @@ struct Established {
 /// The result of a connection attempt (dial or accept), reported to the loop.
 enum ConnResult {
     Established(Box<Established>),
-    Failed(String),
+    /// A dial or accept failed. `from_accept` records which, so the loop knows
+    /// whether the background *listener* died (and must be re-armed) or merely an
+    /// outbound dial did (leaving the listener untouched).
+    Failed {
+        reason: String,
+        from_accept: bool,
+    },
 }
 
 /// The handles for the currently connected session.
@@ -177,6 +190,9 @@ async fn run(
                                 old.reader.abort();
                                 tokio::spawn(farewell(old.conn, old.outgoing_tx, old.writer));
                                 app.push_system("left the current chat");
+                                // Accepting was paused while we were connected; resume it
+                                // so we keep listening (and stay reachable) while we dial.
+                                accept_handle = arm_accept(&endpoint, my_id, auth_seed, &conn_tx);
                             }
                             accepted = false;
                             app.set_connecting(peer.fmt_short().to_string());
@@ -252,9 +268,13 @@ async fn run(
                         app.set_verifying(peer.fmt_short().to_string(), safety_number);
                     }
                 }
-                // Dial/accept failed: return to the lobby and keep listening.
-                Some(ConnResult::Failed(reason)) if session.is_none() => {
-                    accept_handle = arm_accept(&endpoint, my_id, auth_seed, &conn_tx);
+                // Dial/accept failed: return to the lobby. Re-arm the listener only if
+                // it was the listener that died; a failed *dial* leaves the still-live
+                // listener alone (re-arming it here would leak the running task).
+                Some(ConnResult::Failed { reason, from_accept }) if session.is_none() => {
+                    if from_accept {
+                        accept_handle = arm_accept(&endpoint, my_id, auth_seed, &conn_tx);
+                    }
                     app.set_lobby(reason);
                 }
                 _ => {}
@@ -337,6 +357,9 @@ async fn farewell(
 }
 
 /// Dial a peer and run the initiator side of the handshake, reporting the result.
+///
+/// The whole attempt (connect + handshake) is bounded by [`HANDSHAKE_TIMEOUT`] so
+/// an unresponsive peer can't leave the UI stuck in "connecting…" forever.
 async fn dial_and_handshake(
     endpoint: Endpoint,
     my_id: EndpointId,
@@ -360,13 +383,25 @@ async fn dial_and_handshake(
             peer,
         })
     };
-    let _ = tx.send(match attempt.await {
-        Ok(established) => ConnResult::Established(Box::new(established)),
-        Err(err) => ConnResult::Failed(format!("could not connect: {err}")),
-    });
+    let result = match tokio::time::timeout(HANDSHAKE_TIMEOUT, attempt).await {
+        Ok(Ok(established)) => ConnResult::Established(Box::new(established)),
+        Ok(Err(err)) => ConnResult::Failed {
+            reason: format!("could not connect: {err}"),
+            from_accept: false,
+        },
+        Err(_) => ConnResult::Failed {
+            reason: "could not connect: handshake timed out".into(),
+            from_accept: false,
+        },
+    };
+    let _ = tx.send(result);
 }
 
 /// Wait for an incoming peer and run the responder side of the handshake.
+///
+/// Only the handshake is time-boxed (by [`HANDSHAKE_TIMEOUT`]) — not the idle wait
+/// for a peer to arrive — so a peer that connects and then stalls can't tie up the
+/// listener indefinitely.
 async fn accept_and_handshake(
     endpoint: Endpoint,
     my_id: EndpointId,
@@ -375,25 +410,32 @@ async fn accept_and_handshake(
 ) {
     let attempt = async {
         let (conn, mut send, mut recv) = transport::accept(&endpoint).await?;
-        let peer = conn.remote_id();
-        let identity = crypto::SigningIdentity::from_seed(&auth_seed);
-        let msg1 = proto::read_frame(&mut recv).await?;
-        let (pending, msg2) =
-            crypto::responder_receive(&msg1, peer.as_bytes(), my_id.as_bytes(), identity)?;
-        proto::write_frame(&mut send, &msg2).await?;
-        let msg3 = proto::read_frame(&mut recv).await?;
-        let session = pending.finish(&msg3)?;
-        anyhow::Ok(Established {
-            conn,
-            send,
-            recv,
-            session,
-            peer,
+        tokio::time::timeout(HANDSHAKE_TIMEOUT, async move {
+            let peer = conn.remote_id();
+            let identity = crypto::SigningIdentity::from_seed(&auth_seed);
+            let msg1 = proto::read_frame(&mut recv).await?;
+            let (pending, msg2) =
+                crypto::responder_receive(&msg1, peer.as_bytes(), my_id.as_bytes(), identity)?;
+            proto::write_frame(&mut send, &msg2).await?;
+            let msg3 = proto::read_frame(&mut recv).await?;
+            let session = pending.finish(&msg3)?;
+            anyhow::Ok(Established {
+                conn,
+                send,
+                recv,
+                session,
+                peer,
+            })
         })
+        .await
+        .map_err(|_| anyhow::anyhow!("handshake timed out"))?
     };
     let _ = tx.send(match attempt.await {
         Ok(established) => ConnResult::Established(Box::new(established)),
-        Err(err) => ConnResult::Failed(format!("incoming connection failed: {err}")),
+        Err(err) => ConnResult::Failed {
+            reason: format!("incoming connection failed: {err}"),
+            from_accept: true,
+        },
     });
 }
 
