@@ -14,6 +14,11 @@ use iroh::endpoint::{RecvStream, SendStream};
 const MAX_FRAME: usize = 64 * 1024;
 
 /// Write one length-prefixed frame.
+///
+/// # Errors
+///
+/// Fails if `data` is larger than a `u32` length prefix can express, or the
+/// underlying stream write fails.
 pub async fn write_frame(send: &mut SendStream, data: &[u8]) -> Result<()> {
     let len = u32::try_from(data.len()).map_err(|_| anyhow::anyhow!("frame too large to send"))?;
     send.write_all(&len.to_be_bytes()).await?;
@@ -22,6 +27,11 @@ pub async fn write_frame(send: &mut SendStream, data: &[u8]) -> Result<()> {
 }
 
 /// Read one length-prefixed frame.
+///
+/// # Errors
+///
+/// Fails if the stream ends before a full frame arrives, or the peer's length
+/// prefix exceeds [`MAX_FRAME`].
 pub async fn read_frame(recv: &mut RecvStream) -> Result<Vec<u8>> {
     let mut len_buf = [0u8; 4];
     recv.read_exact(&mut len_buf).await?;

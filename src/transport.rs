@@ -26,6 +26,11 @@ pub const ALPN: &[u8] = b"kiss-chat/0";
 /// Loads (or, on first run, creates) a persistent identity so the endpoint keeps
 /// the same address between runs.
 ///
+/// # Errors
+///
+/// Fails if the persistent identity can't be loaded or created, or the endpoint
+/// can't bind a socket.
+///
 /// [`EndpointId`]: iroh::EndpointId
 pub async fn bind() -> Result<Endpoint> {
     let secret_key = identity::load_or_create_endpoint_secret()?;
@@ -40,6 +45,11 @@ pub async fn bind() -> Result<Endpoint> {
 /// Dial `peer` (an [`EndpointId`] resolved via discovery, or a full
 /// [`EndpointAddr`]) and open the single chat stream. We are the initiator, so we
 /// must be the first to write to the stream (the caller sends the handshake's msg1).
+///
+/// # Errors
+///
+/// Fails if the peer can't be reached (discovery or connection) or the chat stream
+/// can't be opened.
 ///
 /// [`EndpointId`]: iroh::EndpointId
 pub async fn dial(
@@ -56,6 +66,11 @@ pub async fn dial(
 
 /// Wait for one inbound peer and accept its chat stream. `accept_bi` returns once
 /// the initiator has sent its first bytes (msg1).
+///
+/// # Errors
+///
+/// Fails if the endpoint is closed, the inbound QUIC handshake fails, or the chat
+/// stream can't be accepted.
 pub async fn accept(endpoint: &Endpoint) -> Result<(Connection, SendStream, RecvStream)> {
     let incoming = endpoint.accept().await.context("endpoint closed")?;
     let conn = incoming.await.context("inbound handshake failed")?;

@@ -112,6 +112,7 @@ pub struct SigningIdentity {
 
 impl SigningIdentity {
     /// Derive the identity from its 32-byte seed.
+    #[must_use]
     pub fn from_seed(seed: &[u8; 32]) -> Self {
         let signing_key = SigningKey::<MlDsa87>::from_seed(&B32::from(*seed));
         let verifying_key = signing_key.verifying_key().encode().to_vec();
@@ -122,6 +123,7 @@ impl SigningIdentity {
     }
 
     /// Our ML-DSA verifying (public) key, as sent on the wire.
+    #[must_use]
     pub fn public_bytes(&self) -> &[u8] {
         &self.verifying_key
     }
@@ -150,6 +152,7 @@ pub struct Initiator {
 }
 
 /// Build the initiator's first handshake message.
+#[must_use]
 pub fn initiator_start(identity: SigningIdentity) -> Initiator {
     let (dk, ek) = MlKem1024::generate_keypair();
     let x_secret = StaticSecret::from(random_bytes());
@@ -169,6 +172,7 @@ pub fn initiator_start(identity: SigningIdentity) -> Initiator {
 
 impl Initiator {
     /// The bytes to send to the responder.
+    #[must_use]
     pub fn msg1(&self) -> &[u8] {
         &self.msg1
     }
@@ -177,6 +181,11 @@ impl Initiator {
     /// plus msg3 (our own signature over the transcript).
     ///
     /// `initiator_id` is our own iroh EndpointId, `responder_id` the peer's.
+    ///
+    /// # Errors
+    ///
+    /// Fails if msg2 is truncated or malformed, or if the responder's signature
+    /// does not verify against the transcript (a MITM, or a corrupted message).
     pub fn finish(
         self,
         msg2: &[u8],
@@ -228,6 +237,11 @@ pub struct PendingResponder {
 
 /// Handle the initiator's msg1: derive the shared secret, sign the transcript, and
 /// return our reply (msg2) together with a [`PendingResponder`] awaiting msg3.
+///
+/// # Errors
+///
+/// Fails if msg1 is truncated or carries a malformed ML-KEM encapsulation key,
+/// X25519 key, or ML-DSA identity key.
 pub fn responder_receive(
     msg1: &[u8],
     initiator_id: &[u8; 32],
@@ -277,6 +291,11 @@ pub fn responder_receive(
 
 impl PendingResponder {
     /// Verify the initiator's signature (msg3) and hand back the trusted [`Session`].
+    ///
+    /// # Errors
+    ///
+    /// Fails if msg3 is the wrong length or the initiator's signature does not
+    /// verify against the transcript.
     pub fn finish(self, msg3: &[u8]) -> Result<Session> {
         ensure!(
             msg3.len() == MLDSA_SIG_LEN,
@@ -438,6 +457,7 @@ impl Session {
 
     /// The out-of-band verification string derived from both identity keys.
     /// Identical on both ends when the channel is genuine.
+    #[must_use]
     pub fn safety_number(&self) -> &str {
         &self.safety_number
     }
@@ -447,12 +467,14 @@ impl Session {
     /// This is the peer's *stable* identity (unlike the per-session safety number,
     /// which folds in fresh ephemeral keys). Pinning it against the peer's address
     /// lets [`crate::contacts`] flag a later identity-key change.
+    #[must_use]
     pub fn peer_identity(&self) -> &[u8] {
         &self.peer_identity
     }
 
     /// Split into directional halves. The direction tags depend on our role so
     /// the two peers never collide on a nonce.
+    #[must_use]
     pub fn split(self) -> (Sealer, Opener) {
         let (send_dir, recv_dir) = match self.role {
             Role::Initiator => (DIR_I2R, DIR_R2I),
@@ -491,6 +513,11 @@ pub struct Sealer {
 
 impl Sealer {
     /// Encrypt `plaintext`, advancing the nonce counter.
+    ///
+    /// # Errors
+    ///
+    /// Fails if the per-direction nonce counter is exhausted (after 2^64 messages)
+    /// or the AEAD reports an encryption error.
     pub fn seal(&mut self, plaintext: &[u8]) -> Result<Vec<u8>> {
         let nonce = make_nonce(self.dir, self.counter);
         self.counter = self
@@ -515,6 +542,11 @@ impl Opener {
     ///
     /// Because nonces are deterministic, a dropped/reordered/forged frame makes
     /// authentication fail and the session is torn down by the caller.
+    ///
+    /// # Errors
+    ///
+    /// Fails if authentication does not verify (tampered, reordered, or dropped
+    /// frame) or the nonce counter is exhausted.
     pub fn open(&mut self, ciphertext: &[u8]) -> Result<Vec<u8>> {
         let nonce = make_nonce(self.dir, self.counter);
         let plaintext = self
