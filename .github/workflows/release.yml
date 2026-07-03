@@ -1,0 +1,109 @@
+name: Release
+
+on:
+  # Fires when a GitHub release is published (e.g. via `gh release create`),
+  # which matches the project's release flow.
+  release:
+    types: [published]
+  # Manual fallback: build and attach binaries to an existing tag/release.
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Existing tag to build and attach binaries to (e.g. v0.3.4)"
+        required: true
+
+permissions:
+  # Needed to upload the built archives as release assets.
+  contents: write
+
+env:
+  CARGO_TERM_COLOR: always
+  # Tag driving both the checkout and the asset names.
+  TAG: ${{ github.event.release.tag_name || inputs.tag }}
+
+jobs:
+  build:
+    name: ${{ matrix.target }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - target: x86_64-unknown-linux-gnu
+            os: ubuntu-latest
+          - target: aarch64-unknown-linux-gnu
+            os: ubuntu-latest
+          # Statically linked (musl) — runs on any Linux without a libc match.
+          - target: x86_64-unknown-linux-musl
+            os: ubuntu-latest
+          - target: aarch64-apple-darwin
+            os: macos-latest
+          # Cross-compiled from the Apple-Silicon runner (the macOS toolchain is
+          # universal), so no separate Intel runner is needed.
+          - target: x86_64-apple-darwin
+            os: macos-latest
+          - target: x86_64-pc-windows-msvc
+            os: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          # Build the exact code the release tag points at, on either trigger.
+          ref: ${{ github.event.release.tag_name || inputs.tag }}
+
+      - name: Install Rust (stable)
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+
+      - name: Set up cross toolchain (Linux)
+        if: runner.os == 'Linux'
+        # Installs the cross linker / C toolchain (and musl) so `ring` and the
+        # rest of the native deps cross-compile for the matrix target.
+        uses: taiki-e/setup-cross-toolchain-action@v1
+        with:
+          target: ${{ matrix.target }}
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: ${{ matrix.target }}
+
+      - name: Build
+        run: cargo build --release --locked --target ${{ matrix.target }}
+
+      - name: Package (Unix)
+        if: runner.os != 'Windows'
+        shell: bash
+        run: |
+          set -euo pipefail
+          staging="kiss_chat-${TAG}-${{ matrix.target }}"
+          mkdir "$staging"
+          cp "target/${{ matrix.target }}/release/kiss_chat" "$staging/"
+          cp README.md LICENSE.md "$staging/"
+          tar czf "${staging}.tar.gz" "$staging"
+          if command -v sha256sum >/dev/null 2>&1; then
+            sha256sum "${staging}.tar.gz" > "${staging}.tar.gz.sha256"
+          else
+            shasum -a 256 "${staging}.tar.gz" > "${staging}.tar.gz.sha256"
+          fi
+
+      - name: Package (Windows)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          $staging = "kiss_chat-$env:TAG-${{ matrix.target }}"
+          New-Item -ItemType Directory -Path $staging | Out-Null
+          Copy-Item "target/${{ matrix.target }}/release/kiss_chat.exe" $staging
+          Copy-Item README.md, LICENSE.md $staging
+          Compress-Archive -Path $staging -DestinationPath "$staging.zip"
+          (Get-FileHash "$staging.zip" -Algorithm SHA256).Hash.ToLower() `
+            + "  $staging.zip" | Out-File -Encoding ascii "$staging.zip.sha256"
+
+      - name: Upload assets to the release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ env.TAG }}
+          files: |
+            kiss_chat-${{ env.TAG }}-${{ matrix.target }}.tar.gz
+            kiss_chat-${{ env.TAG }}-${{ matrix.target }}.tar.gz.sha256
+            kiss_chat-${{ env.TAG }}-${{ matrix.target }}.zip
+            kiss_chat-${{ env.TAG }}-${{ matrix.target }}.zip.sha256
