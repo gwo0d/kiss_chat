@@ -55,6 +55,25 @@ This puts a `kiss_chat` binary on your `PATH` (in `~/.cargo/bin/`). Anywhere the
 `cargo run`, you can run `kiss_chat` instead — e.g. `kiss_chat` to start in the lobby, or
 `kiss_chat <peer-id>` to dial a peer directly.
 
+### Prebuilt binaries
+
+Every [release](https://github.com/gwo0d/kiss_chat/releases/latest) also ships prebuilt binaries
+for Linux, macOS, and Windows (each with a SHA-256 checksum) — download, extract, and run, no
+toolchain required.
+
+**macOS: the binaries are not code-signed.** If you download one through a browser, Gatekeeper
+will refuse to open it ("Apple could not verify … is free of malware"), because it is neither
+signed with an Apple Developer ID nor notarised. Clear the quarantine flag once and it runs
+normally:
+
+```bash
+xattr -d com.apple.quarantine ./kiss_chat
+```
+
+Alternatively, open **System Settings → Privacy & Security** and click **Open Anyway**, or avoid
+the issue entirely with `cargo install kiss_chat` — locally compiled binaries are never
+quarantined.
+
 ## Build from source
 
 ```bash
