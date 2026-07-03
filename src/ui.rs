@@ -70,7 +70,16 @@ enum Author {
     /// A security-relevant notice (e.g. a peer's identity key changed), styled to
     /// stand out from ordinary system chatter.
     Warning,
+    /// The out-of-band safety words. The one thing on the verify screen the user
+    /// must actually scrutinise, so it gets its own bold, numbered block instead of
+    /// being buried in the dim system chatter. `text` holds the raw space-separated
+    /// phrase; the grid layout is computed at render time to fit the terminal width.
+    Safety,
 }
+
+/// Accent colour for the safety words — high-contrast and distinct from the You /
+/// Peer / System / Warning palette so the block reads as its own thing.
+const SAFETY_ACCENT: Color = Color::LightYellow;
 
 struct ChatLine {
     author: Author,
@@ -141,6 +150,11 @@ impl App {
         self.push(Author::Peer, text);
     }
 
+    /// Push the safety words as their own highlighted, numbered block.
+    fn push_safety(&mut self, phrase: impl Into<String>) {
+        self.push(Author::Safety, phrase.into());
+    }
+
     /// Enter the "dialing a peer" state.
     pub fn set_connecting(&mut self, peer_short: String) {
         self.mode = Mode::Connecting;
@@ -193,9 +207,10 @@ impl App {
                 );
             }
         }
-        self.push_system(format!("  safety words:  {safety_number}"));
-        self.push_system("read them aloud with your peer over a trusted channel — every word");
-        self.push_system("must match, in order. The safety words are what you trust, not names.");
+        self.push_safety(safety_number);
+        self.push_system("read these aloud with your peer over a channel you already trust");
+        self.push_system("(a phone call, in person) — every word must match, in order.");
+        self.push_system("the safety words are what you trust, never a display name.");
         self.push_system("  /accept   every word matches — start chatting");
         self.push_system("  /reject   any word differs — disconnect");
     }
@@ -465,7 +480,8 @@ impl App {
                 if self.safety_number.is_empty() {
                     self.push_system("no safety words yet — connect to a peer first");
                 } else {
-                    self.push_system(format!("  safety words:  {}", self.safety_number));
+                    let phrase = self.safety_number.clone();
+                    self.push_safety(phrase);
                 }
                 Action::None
             }
@@ -586,11 +602,18 @@ fn timestamp_now() -> String {
 /// `peer_name` is the peer's chosen display name, if known; it labels their lines
 /// in place of the generic "peer".
 fn wrapped_lines(line: &ChatLine, width: usize, peer_name: Option<&str>) -> Vec<Line<'static>> {
+    // The safety words get a bespoke layout (numbered grid) rather than the
+    // label-plus-body treatment every other line shares.
+    if matches!(line.author, Author::Safety) {
+        return safety_lines(&line.text, width, &line.timestamp);
+    }
     let (label, color): (&str, Color) = match line.author {
         Author::You => ("you", Color::Cyan),
         Author::Peer => (peer_name.unwrap_or("peer"), Color::Green),
         Author::System => ("--", Color::DarkGray),
         Author::Warning => ("!!", Color::Red),
+        // Handled by the early return above; kept for exhaustiveness.
+        Author::Safety => ("safety", SAFETY_ACCENT),
     };
     let time = format!("{} ", line.timestamp);
     let head = format!("{label}: ");
@@ -631,6 +654,56 @@ fn wrapped_lines(line: &ChatLine, width: usize, peer_name: Option<&str>) -> Vec<
             }
         })
         .collect()
+}
+
+/// Render the safety words as a highlighted, numbered grid framed by blank lines.
+///
+/// Numbering each word lets peers compare by position (so a dropped or swapped
+/// word is obvious), and the accent colour plus bold weight lift the block clear
+/// of the dim system chatter around it. The grid reflows to `width`: as many
+/// columns as fit, collapsing to a single column in a narrow terminal.
+fn safety_lines(phrase: &str, width: usize, timestamp: &str) -> Vec<Line<'static>> {
+    let words: Vec<&str> = phrase.split_whitespace().collect();
+    let dim = Style::new().fg(Color::DarkGray);
+    let accent = Style::new().fg(SAFETY_ACCENT).add_modifier(Modifier::BOLD);
+
+    // A blank spacer above, then the header carrying the timestamp prefix.
+    let mut lines = vec![
+        Line::from(""),
+        Line::from(vec![
+            Span::styled(format!("{timestamp} "), dim),
+            Span::styled("safety words", accent),
+        ]),
+    ];
+
+    if words.is_empty() {
+        return lines;
+    }
+
+    // Cell = right-aligned number, a space, then the word padded to a common
+    // width with a two-space gutter. Column count is whatever fits `width`.
+    let indent = 4usize;
+    let longest = words.iter().map(|w| w.chars().count()).max().unwrap_or(1);
+    let num_w = words.len().to_string().len().max(2);
+    let cell_w = num_w + 1 + longest + 2;
+    let usable = width.saturating_sub(indent).max(cell_w);
+    let cols = (usable / cell_w).max(1);
+
+    for (row, chunk) in words.chunks(cols).enumerate() {
+        let mut spans = vec![Span::raw(" ".repeat(indent))];
+        for (col, word) in chunk.iter().enumerate() {
+            let n = row * cols + col + 1;
+            spans.push(Span::styled(format!("{n:>num_w$} "), dim));
+            spans.push(Span::styled(
+                format!("{:<pad$}", word, pad = longest + 2),
+                accent,
+            ));
+        }
+        lines.push(Line::from(spans));
+    }
+    // A blank spacer below, so the block stands apart from the guidance that follows.
+    lines.push(Line::from(""));
+    lines
 }
 
 /// Word-wrap `text` to at most `width` characters per line, hard-splitting any
@@ -943,6 +1016,46 @@ mod tests {
         app.on_key(KeyEvent::new(KeyCode::Char('u'), KeyModifiers::CONTROL));
         assert_eq!(app.input, "");
         assert_eq!(app.cursor, 0);
+    }
+
+    // Join a rendered block back into one blob for substring assertions.
+    fn render_blob(line: &ChatLine, width: usize) -> String {
+        wrapped_lines(line, width, None)
+            .iter()
+            .map(line_text)
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
+
+    fn safety_line(phrase: &str) -> ChatLine {
+        ChatLine {
+            author: Author::Safety,
+            text: phrase.into(),
+            timestamp: "12:00".into(),
+        }
+    }
+
+    #[test]
+    fn safety_words_render_as_a_numbered_block() {
+        let phrase = "alpha bravo charlie delta echo foxtrot golf hotel india juliet kilo lima";
+        let blob = render_blob(&safety_line(phrase), 80);
+        assert!(blob.contains("safety words"));
+        // Every word survives, and the first and last carry their position number.
+        for word in phrase.split_whitespace() {
+            assert!(blob.contains(word), "missing safety word: {word}");
+        }
+        assert!(blob.contains("1 alpha"), "words should be numbered");
+        assert!(blob.contains("12 lima"), "final word should be numbered 12");
+    }
+
+    #[test]
+    fn safety_block_keeps_every_word_in_a_narrow_terminal() {
+        // At a width that forces a single column, no word may be dropped.
+        let phrase = "alpha bravo charlie delta echo foxtrot golf hotel india juliet kilo lima";
+        let blob = render_blob(&safety_line(phrase), 16);
+        for word in phrase.split_whitespace() {
+            assert!(blob.contains(word), "narrow render dropped: {word}");
+        }
     }
 
     #[test]
