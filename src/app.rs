@@ -224,7 +224,8 @@ async fn event_loop(
                         }
                     }
                     Action::RejectPeer => {
-                        // The safety number didn't match: leave and return to the lobby.
+                        // The user declined (safety words mismatched, or an unwanted
+                        // connection): leave and return to the lobby.
                         if let Some(old) = session.take() {
                             old.reader.abort();
                             tokio::spawn(farewell(old.conn, old.outgoing_tx, old.writer));
@@ -298,8 +299,9 @@ async fn event_loop(
                             peer_identity,
                             peer_name: None,
                         });
-                        // The channel is up, but hold chat until the user has compared
-                        // the safety number out-of-band and accepted.
+                        // The channel is up, but hold chat until the user accepts —
+                        // comparing the safety words out-of-band for a new or changed
+                        // peer, or just consenting to reconnect for a recognised one.
                         app.set_verifying(peer.fmt_short().to_string(), safety_number, pin, known_name);
                     }
                 }

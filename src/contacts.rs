@@ -1,10 +1,11 @@
 //! Persistent contact list with identity-key pinning (trust-on-first-use).
 //!
-//! kiss_chat authenticates every session with the out-of-band **safety words**, but
-//! on its own the handshake cannot tell you whether the peer at a given address is
-//! the *same* one you verified last time: a rotated — or spoofed — identity key
-//! still produces a perfectly valid (differently-worded) handshake. This module
-//! closes that gap.
+//! kiss_chat verifies a peer with the out-of-band **safety words** the first time you
+//! meet them, but on its own the handshake cannot tell you whether the peer at a given
+//! address is the *same* one you verified last time: a rotated — or spoofed — identity
+//! key still produces a perfectly valid (differently-worded) handshake. This module
+//! closes that gap, so a peer you've already verified is *recognised* on sight and
+//! reconnects with a quick consent step rather than a fresh safety-word comparison.
 //!
 //! When you `/accept` a peer, we pin their long-term ML-DSA identity key against
 //! their iroh address (their [`EndpointId`], as text). On a later connection from

@@ -5,9 +5,10 @@
 //! acting on the [`Action`]s that key presses produce.
 //!
 //! The input line is a command prompt (`/connect`, `/help`, `/quit`) until a peer
-//! is connected. When a channel comes up the app enters a **verify** step: the user
-//! compares the session safety number out-of-band and `/accept`s or `/reject`s.
-//! Only once accepted do typed lines get sent as chat messages.
+//! is connected. When a channel comes up the app holds it in a **verify** gate: a
+//! first-seen (or changed-key) peer must have their safety words compared out-of-band,
+//! while a peer you've verified before is simply *recognised* and asked only for a
+//! quick `/accept`. Either way nothing is sent until the user `/accept`s (or `/reject`s).
 //!
 //! Timestamps shown next to messages are in UTC.
 
@@ -99,6 +100,11 @@ pub struct App {
     /// Short peer id and safety number of the session under verification / in use.
     peer_short: String,
     safety_number: String,
+    /// While gating a channel ([`Mode::Verifying`]), whether the peer was already
+    /// recognised — their identity key matches a pin we verified before. A recognised
+    /// peer gets a light re-connect consent instead of the full safety-word ritual.
+    /// Only meaningful in `Mode::Verifying`; overwritten on each gate.
+    recognized: bool,
     /// The peer's chosen display name, once they share it (only after accepting).
     peer_name: Option<String>,
     /// Our own address, kept so `/address` can recall it after `/clear`.
@@ -118,6 +124,7 @@ impl App {
             scroll_lines: 0,
             peer_short: String::new(),
             safety_number: String::new(),
+            recognized: false,
             peer_name: None,
             my_address: my_address.clone(),
             should_quit: false,
@@ -162,14 +169,24 @@ impl App {
         self.push_system(format!("connecting to {peer_short}…"));
     }
 
-    /// Enter the verify step once a channel is established: the safety words must
-    /// be compared out-of-band before chatting begins.
+    /// Enter the gate that holds a freshly-established channel before any chatting.
     ///
-    /// `pin` says how the peer's long-term identity key compares to any we pinned
-    /// for this address on a previous `/accept`, so the user is told whether this is
-    /// a first meeting, a recognised peer, or — the case that matters — one whose
-    /// identity key has changed since last time. `known_name` is the display name we
-    /// cached for a recognised peer, shown so they can be identified at a glance.
+    /// `pin` says how the peer's long-term identity key compares to any we pinned for
+    /// this address on a previous `/accept`, which decides how much the user is asked
+    /// to do:
+    ///
+    ///   - [`PinStatus::New`] — a first meeting: show the safety words and ask the user
+    ///     to compare them out-of-band before accepting (trust-on-first-use).
+    ///   - [`PinStatus::Changed`] — the identity key differs from the pin: the same
+    ///     out-of-band comparison, but preceded by a prominent warning.
+    ///   - [`PinStatus::Known`] — the key matches a pin we already verified once. The
+    ///     handshake signatures re-authenticate the peer every session, so re-reading
+    ///     the safety words adds nothing; we ask only for a light consent to reconnect,
+    ///     while still leaving the words a `/safety` away for the cautious.
+    ///
+    /// Either way the channel is held in [`Mode::Verifying`] until the user `/accept`s,
+    /// so a peer can never force us into a chat without our say-so. `known_name` is the
+    /// name cached for a recognised peer, shown so they're identifiable at a glance.
     pub fn set_verifying(
         &mut self,
         peer_short: String,
@@ -180,21 +197,43 @@ impl App {
         self.mode = Mode::Verifying;
         self.peer_short = peer_short;
         self.safety_number = safety_number.clone();
-        // A display name from a previous peer must not leak into this session.
+        self.recognized = pin == PinStatus::Known;
+        // Default to no name. A name cached under a *different* (New/Changed) identity
+        // must never be shown as if it belonged to this peer; the recognised branch
+        // below restores it, since there the cached name *is* this same identity's.
         self.peer_name = None;
+
+        if self.recognized {
+            self.status = format!("reconnect {} · /accept or /reject", self.peer_short);
+            self.peer_name = known_name.clone();
+            match &known_name {
+                Some(name) => self.push_system(format!(
+                    "incoming connection from \"{name}\" ({}) — recognised.",
+                    self.peer_short
+                )),
+                None => self.push_system(format!(
+                    "incoming connection from {} — recognised.",
+                    self.peer_short
+                )),
+            }
+            self.push_system(
+                "the identity key matches the one you verified before, so there's nothing new",
+            );
+            self.push_system(
+                "to check — the handshake signatures already prove it's the same peer.",
+            );
+            self.push_system("  /accept   accept and start chatting");
+            self.push_system("  /reject   decline this connection");
+            self.push_system("  /safety   re-show the safety words, to compare them again");
+            return;
+        }
+
         self.status = format!("verify {} · compare the safety words", self.peer_short);
         self.push_system("channel up — now verify you're talking to the right person:");
         match pin {
             PinStatus::New => self.push_system(
                 "first time you've accepted this address — check the safety words with care.",
             ),
-            PinStatus::Known => self.push_system(match &known_name {
-                Some(name) => format!(
-                    "recognised as \"{name}\" — this address's identity key matches the one you verified before."
-                ),
-                None => "recognised — this address's identity key matches the one you verified before."
-                    .to_string(),
-            }),
             PinStatus::Changed => {
                 self.push_warning(
                     "⚠ this address's identity key has CHANGED since you last accepted it.",
@@ -206,6 +245,8 @@ impl App {
                     "re-check every safety word especially carefully before you /accept.",
                 );
             }
+            // Handled by the recognised early-return above; kept for exhaustiveness.
+            PinStatus::Known => {}
         }
         self.push_safety(safety_number);
         self.push_system("read these aloud with your peer over a channel you already trust");
@@ -219,7 +260,12 @@ impl App {
     fn mark_connected(&mut self) {
         self.mode = Mode::Connected;
         self.status = self.connected_status();
-        self.push_system("verified — type a message and press Enter; /quit to leave.");
+        let note = if self.recognized {
+            "reconnected — type a message and press Enter; /quit to leave."
+        } else {
+            "verified — type a message and press Enter; /quit to leave."
+        };
+        self.push_system(note);
     }
 
     /// The status-bar text for an active chat, folding in the peer's name if known.
@@ -409,7 +455,11 @@ impl App {
                 Action::Send(line)
             }
             Mode::Verifying => {
-                self.push_system("compare the safety words first: /accept or /reject");
+                if self.recognized {
+                    self.push_system("this connection is waiting on you: /accept or /reject");
+                } else {
+                    self.push_system("compare the safety words first: /accept or /reject");
+                }
                 Action::None
             }
             _ => {
@@ -500,7 +550,7 @@ impl App {
                     "  /connect <peer-id>   dial a peer (switches if already connected)",
                 );
                 self.push_system(
-                    "  /accept              accept the peer after comparing the safety words",
+                    "  /accept              accept the peer (compare the safety words first, if prompted)",
                 );
                 self.push_system("  /reject              reject the peer being verified");
                 self.push_system(
@@ -568,6 +618,9 @@ impl App {
         // Input line: prompt reflects whether we're chatting, verifying, or commanding.
         let (label, color) = match self.mode {
             Mode::Connected => ("message", Color::Blue),
+            Mode::Verifying if self.recognized => {
+                ("accept connection? /accept or /reject", Color::Yellow)
+            }
             Mode::Verifying => ("verify: /accept or /reject", Color::Yellow),
             Mode::Connecting => ("connecting…", Color::Yellow),
             Mode::Lobby => ("command (/connect <peer-id>, /help)", Color::Magenta),
@@ -874,8 +927,72 @@ mod tests {
         assert!(
             app.history
                 .iter()
-                .any(|l| l.text.contains("recognised as \"Alice\"")),
+                .any(|l| l.text.contains("from \"Alice\"")),
             "a recognised peer's cached name should be shown"
+        );
+    }
+
+    #[test]
+    fn recognised_peer_skips_the_safety_word_ritual() {
+        // A known peer is asked only for consent — the safety-word block is not shown
+        // up front, and the prompt reads as an incoming-connection consent.
+        let mut app = App::new("my-addr".into());
+        app.set_verifying("peer".into(), "ab-cd".into(), PinStatus::Known, None);
+        assert!(
+            !app.history
+                .iter()
+                .any(|l| matches!(l.author, Author::Safety)),
+            "a recognised peer should not be shown the safety words up front"
+        );
+        assert!(
+            app.history
+                .iter()
+                .any(|l| l.text.contains("incoming connection")),
+            "a recognised peer should get a consent-to-connect prompt"
+        );
+    }
+
+    #[test]
+    fn a_new_or_changed_peer_is_shown_the_safety_words() {
+        for pin in [PinStatus::New, PinStatus::Changed] {
+            let mut app = App::new("my-addr".into());
+            app.set_verifying("peer".into(), "ab-cd".into(), pin, None);
+            assert!(
+                app.history
+                    .iter()
+                    .any(|l| matches!(l.author, Author::Safety)),
+                "an unrecognised or changed peer must show the safety words to compare"
+            );
+        }
+    }
+
+    #[test]
+    fn recognised_peer_still_requires_explicit_accept() {
+        // The consent gate stands: a recognised peer can't force us straight into chat.
+        let mut app = App::new("my-addr".into());
+        app.set_verifying("peer".into(), "ab-cd".into(), PinStatus::Known, None);
+        // Typing plain text does not slip past the gate.
+        assert!(matches!(submit_line(&mut app, "hi"), Action::None));
+        // Only /accept proceeds.
+        assert!(matches!(submit_line(&mut app, "/accept"), Action::Accept));
+    }
+
+    #[test]
+    fn safety_command_reshows_words_for_a_recognised_peer() {
+        // Even when the ritual is skipped, the user can pull the words up on demand.
+        let mut app = App::new("my-addr".into());
+        app.set_verifying("peer".into(), "ab-cd".into(), PinStatus::Known, None);
+        assert!(
+            !app.history
+                .iter()
+                .any(|l| matches!(l.author, Author::Safety))
+        );
+        let _ = submit_line(&mut app, "/safety");
+        assert!(
+            app.history
+                .iter()
+                .any(|l| matches!(l.author, Author::Safety)),
+            "/safety must surface the words even for a recognised peer"
         );
     }
 
