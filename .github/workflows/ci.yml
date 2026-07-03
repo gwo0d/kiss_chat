@@ -1,0 +1,93 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+  schedule:
+    # Weekly run so `cargo audit` keeps flagging newly-published advisories
+    # even when nothing has been pushed.
+    - cron: "0 6 * * 1"
+
+# Cancel superseded runs on the same ref (a fresh push to a PR/branch).
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+  # Treat every warning as an error in CI so they can't accumulate.
+  RUSTFLAGS: "-D warnings"
+
+jobs:
+  fmt:
+    name: rustfmt
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install Rust (stable + rustfmt)
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt
+      - run: cargo fmt --all --check
+
+  clippy:
+    name: clippy
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install Rust (stable + clippy)
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo clippy --all-targets --locked
+
+  test:
+    name: test (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest, windows-latest]
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install Rust (stable)
+        uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: ${{ matrix.os }}
+      - name: Build
+        run: cargo build --all-targets --locked
+      - name: Test
+        # Runs unit, integration (real iroh loopback endpoints), and doc tests.
+        run: cargo test --locked
+
+  audit:
+    name: cargo-audit
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install cargo-audit
+        uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-audit
+      - name: Audit dependencies
+        # Ignored advisories are transitive-only and not remotely reachable in
+        # kiss_chat; see the reasoning below. Any *new* advisory still fails CI.
+        #
+        #   RUSTSEC-2026-0194 / -0195  quick-xml DoS. Pulled in via
+        #     iroh -> netwatch -> netdev -> plist -> quick-xml; plist pins an
+        #     old quick-xml and is already at its latest release, so it cannot be
+        #     bumped from here. It only parses the local OS network-interface
+        #     plist, never peer-supplied bytes, so it is not remotely reachable.
+        #   RUSTSEC-2024-0436  `paste` unmaintained. Warning only, transitive.
+        run: >
+          cargo audit
+          --ignore RUSTSEC-2026-0194
+          --ignore RUSTSEC-2026-0195
+          --ignore RUSTSEC-2024-0436

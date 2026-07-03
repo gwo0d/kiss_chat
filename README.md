@@ -6,6 +6,11 @@
   <img alt="kiss_chat" src="https://raw.githubusercontent.com/gwo0d/kiss_chat/main/assets/lockup-light.svg" width="440">
 </picture>
 
+[![CI](https://img.shields.io/github/actions/workflow/status/gwo0d/kiss_chat/ci.yml?branch=main&label=CI&logo=github)](https://github.com/gwo0d/kiss_chat/actions/workflows/ci.yml)
+[![crates.io](https://img.shields.io/crates/v/kiss_chat.svg?logo=rust)](https://crates.io/crates/kiss_chat)
+[![Downloads](https://img.shields.io/crates/d/kiss_chat.svg)](https://crates.io/crates/kiss_chat)
+[![License: GPL-3.0-or-later](https://img.shields.io/crates/l/kiss_chat.svg)](https://github.com/gwo0d/kiss_chat/blob/main/LICENSE.md)
+
 </div>
 
 A **keep-it-simple** peer-to-peer chat with quantum-resistant end-to-end encryption.
@@ -32,7 +37,9 @@ handful of small Rust modules — simplicity of both architecture and code is th
 
 ## Requirements
 
-- Rust 1.85+ (2024 edition)
+- Rust 1.91+ to build from source. The 2024 edition itself only needs 1.85, but the
+  current dependency tree (via iroh) requires 1.91. Prefer not to build? Grab a
+  prebuilt binary from the [latest release](https://github.com/gwo0d/kiss_chat/releases/latest).
 - Network access for internet-wide connections (peer discovery uses iroh's public
   relay/DNS infrastructure)
 
