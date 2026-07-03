@@ -125,17 +125,26 @@ keys, they can't be precomputed offline, and `/safety` re-shows them at any time
 
 When you `/accept` a peer, kiss_chat pins their long-term ML-DSA identity key against their
 address in a small `contacts` file (trust-on-first-use). Next time you connect to that same
-address, the verify step tells you which of three cases you're in:
+address, kiss_chat tells you which of three cases you're in — and asks only for as much as each
+warrants:
 
 - **first time** — this address is new, so compare the safety words with care;
-- **recognised** — the identity key matches the one you verified before, so you're talking to the
-  same peer you trusted last time;
+- **recognised** — the identity key matches the one you verified before, so the handshake
+  signatures already prove it's the same peer you trusted last time. There's nothing new to
+  compare, so kiss_chat asks only for a quick **"incoming connection from …"** consent — `/accept`
+  to start chatting or `/reject` to decline. (The words are still there if you want them: `/safety`
+  re-shows them at any point.)
 - **⚠ changed** — the identity key is *different* from the one you accepted before. That can be an
   innocent identity reset, or it can be an impersonation attempt, so re-read every safety word
   especially carefully before you `/accept`. Accepting adopts the new key as the pinned one.
 
+A recognised peer still needs your explicit `/accept`, so a remote peer can never pull you into a
+chat without your say-so — the pin removes the *re-verification* chore, not your consent. Making the
+routine reconnection quiet also keeps the ⚠ changed warning meaningful instead of lost in a prompt
+you clear on every session.
+
 Once a peer shares a display name (which only happens after you've both accepted), kiss_chat caches
-it alongside their pin, so a recognised peer is identified by name at the verify step. `/contacts`
+it alongside their pin, so a recognised peer is identified by name at the consent step. `/contacts`
 lists everyone you've accepted — by name, with their address — so you can tell known peers apart at
 a glance and copy an address straight into `/connect`.
 
@@ -150,7 +159,7 @@ The input line doubles as a command prompt:
 | Command | Action |
 |---------|--------|
 | `/connect <peer-id>` | dial a peer; if already connected, leaves that peer and switches (alias `/c`) |
-| `/accept` | accept the peer after every safety word matches (alias `/a`) |
+| `/accept` | accept the peer — after every safety word matches, or just to consent to a recognised one (alias `/a`) |
 | `/reject` | reject the peer being verified and return to the lobby (alias `/r`) |
 | `/name [text]` | set your optional display name; empty clears it (alias `/n`) |
 | `/safety` | re-show the current session's safety words (alias `/s`) |
@@ -239,7 +248,11 @@ identities) means the phrase can't be mined offline, so a MITM can't precompute 
   when you `/accept` a peer, kiss_chat remembers their ML-DSA identity key against their address,
   and warns you on a later connection if that address ever presents a *different* identity key.
   Pinning only covers peers you've accepted, and it keys on the address, so a known peer arriving
-  from a brand-new address is treated as a first meeting rather than a change.
+  from a brand-new address is treated as a first meeting rather than a change. A recognised peer
+  reconnects on a consent step rather than a repeated word-for-word comparison, so their trust then
+  rests on the pin: the `contacts` file is not secret, and a local attacker able to rewrite it could
+  plant a key you'd accept without re-verifying (though such an attacker likely already has your
+  identity seed beside it).
 - The `ml-kem` and `ml-dsa` crates are pure-Rust FIPS 203/204 implementations that have **not**
   had an independent security audit. Treat kiss_chat as a simple, educational P2P chat, not a
   hardened product.
