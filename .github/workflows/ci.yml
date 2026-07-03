@@ -67,6 +67,19 @@ jobs:
         # Runs unit, integration (real iroh loopback endpoints), and doc tests.
         run: cargo test --locked
 
+  msrv:
+    name: msrv (1.91)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install Rust (pinned MSRV)
+        # Must match `rust-version` in Cargo.toml. A dependency bump that raises the
+        # real floor fails here, prompting us to bump both together (and the README).
+        uses: dtolnay/rust-toolchain@1.91.0
+      - uses: Swatinem/rust-cache@v2
+      - name: Check against the MSRV
+        run: cargo check --all-targets --locked
+
   docs:
     name: rustdoc
     runs-on: ubuntu-latest

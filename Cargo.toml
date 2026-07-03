@@ -9,6 +9,8 @@ rust-version = "1.91"
 authors = ["George O. Wood <git@gwood.dev>"]
 license = "GPL-3.0-or-later"
 repository = "https://github.com/gwo0d/kiss_chat"
+keywords = ["chat", "p2p", "post-quantum", "encryption", "tui"]
+categories = ["command-line-utilities", "cryptography"]
 exclude = ["assets/", ".github/"]
 
 [profile.release]
