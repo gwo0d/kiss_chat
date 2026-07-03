@@ -15,10 +15,11 @@ use ratatui::DefaultTerminal;
 use tokio::sync::mpsc::{self, Sender, UnboundedReceiver, UnboundedSender};
 use tokio::task::JoinHandle;
 
+use crate::contacts::PinStatus;
 use crate::crypto::{Opener, Sealer, Session};
 use crate::message::Outgoing;
 use crate::ui::{Action, App, NetEvent};
-use crate::{crypto, identity, message, proto, transport};
+use crate::{contacts, crypto, identity, message, proto, transport};
 
 /// How long to wait for a peer to acknowledge our goodbye before closing anyway.
 const FAREWELL_TIMEOUT: Duration = Duration::from_secs(1);
@@ -63,6 +64,13 @@ struct LiveSession {
     outgoing_tx: UnboundedSender<Outgoing>,
     reader: JoinHandle<()>,
     writer: JoinHandle<()>,
+    /// The peer's iroh address (as text) and long-term ML-DSA identity key, kept so
+    /// that `/accept` can pin them to the contact list for trust-on-first-use.
+    peer_id: String,
+    peer_identity: Vec<u8>,
+    /// The peer's display name once they share it this session, cached so it can be
+    /// stored against their pin (for at-a-glance identification next time).
+    peer_name: Option<String>,
 }
 
 /// Print command-line usage to stdout.
@@ -74,6 +82,25 @@ pub fn print_usage() {
          \x20 kiss_chat <peer-id>    dial a peer immediately\n\n\
          inside the app: /connect <peer-id>, /accept, /reject, /name, /clear, /help, /quit"
     );
+}
+
+/// List the peers we've accepted before (name, if cached, and full address so it can
+/// be copied straight into `/connect`) into the message pane.
+fn list_contacts(app: &mut App) {
+    match contacts::known_peers() {
+        Ok(peers) if peers.is_empty() => {
+            app.push_system("no known peers yet — accepting a peer remembers them here");
+        }
+        Ok(peers) => {
+            let label = if peers.len() == 1 { "peer" } else { "peers" };
+            app.push_system(format!("{} known {label}:", peers.len()));
+            for peer in peers {
+                let name = peer.name.as_deref().unwrap_or("(unnamed)");
+                app.push_system(format!("  {name}  ·  {}", peer.address));
+            }
+        }
+        Err(err) => app.push_system(format!("could not read contacts: {err}")),
+    }
 }
 
 /// Bring up the application: bind the endpoint, load our persistent identity, take
@@ -176,8 +203,24 @@ async fn event_loop(
                     Action::Accept => {
                         // Now — and only now — is it safe to share our display name.
                         accepted = true;
-                        if let (Some(live), Some(name)) = (&session, &my_name) {
-                            let _ = live.outgoing_tx.send(Outgoing::Name(Some(name.clone())));
+                        if let Some(live) = &session {
+                            // Pin (or re-pin) this peer's identity key so a future
+                            // change is flagged. Accepting is the user asserting trust.
+                            if let Err(err) = contacts::remember(&live.peer_id, &live.peer_identity)
+                            {
+                                app.push_system(format!("could not save contact: {err}"));
+                            }
+                            // If the peer already shared a name (they accepted first),
+                            // cache it against the fresh pin now.
+                            if live.peer_name.is_some()
+                                && let Err(err) =
+                                    contacts::set_name(&live.peer_id, live.peer_name.as_deref())
+                            {
+                                app.push_system(format!("could not save contact name: {err}"));
+                            }
+                            if let Some(name) = &my_name {
+                                let _ = live.outgoing_tx.send(Outgoing::Name(Some(name.clone())));
+                            }
                         }
                     }
                     Action::RejectPeer => {
@@ -210,6 +253,7 @@ async fn event_loop(
                             let _ = live.outgoing_tx.send(Outgoing::Text(line));
                         }
                     }
+                    Action::ListContacts => list_contacts(&mut app),
                     Action::None => {}
                 }
             }
@@ -227,6 +271,21 @@ async fn event_loop(
 
                         // Fresh channel: not yet accepted, so no name is shared.
                         accepted = false;
+
+                        // Compare the peer's long-term identity key against any we
+                        // pinned for this address when we last accepted it (TOFU), so
+                        // the verify step can flag a first meeting, a recognised peer
+                        // (by their cached name), or a changed identity key.
+                        let peer_id = peer.to_string();
+                        let peer_identity = new_session.peer_identity().to_vec();
+                        let (pin, known_name) = match contacts::recognize(&peer_id, &peer_identity) {
+                            Ok(rec) => (rec.status, rec.name),
+                            Err(err) => {
+                                app.push_system(format!("could not read contacts: {err}"));
+                                (PinStatus::New, None)
+                            }
+                        };
+
                         let safety_number = new_session.safety_number().to_string();
                         let (sealer, opener) = new_session.split();
                         let (out_tx, out_rx) = mpsc::unbounded_channel::<Outgoing>();
@@ -235,10 +294,13 @@ async fn event_loop(
                             outgoing_tx: out_tx,
                             reader: spawn_reader(recv, opener, net_tx.clone()),
                             writer: spawn_writer(send, sealer, out_rx),
+                            peer_id,
+                            peer_identity,
+                            peer_name: None,
                         });
                         // The channel is up, but hold chat until the user has compared
                         // the safety number out-of-band and accepted.
-                        app.set_verifying(peer.fmt_short().to_string(), safety_number);
+                        app.set_verifying(peer.fmt_short().to_string(), safety_number, pin, known_name);
                     }
                 }
                 // Dial/accept failed: return to the lobby. Re-arm the listener only if
@@ -255,7 +317,19 @@ async fn event_loop(
 
             event = net_rx.recv(), if session.is_some() => match event {
                 Some(NetEvent::Message(text)) => app.push_peer(text),
-                Some(NetEvent::PeerName(name)) => app.set_peer_name(name),
+                Some(NetEvent::PeerName(name)) => {
+                    // Remember the name for this session, and — once we've accepted
+                    // the peer — cache it against their pin for next time.
+                    if let Some(live) = &mut session {
+                        live.peer_name = name.clone();
+                        if accepted
+                            && let Err(err) = contacts::set_name(&live.peer_id, name.as_deref())
+                        {
+                            app.push_system(format!("could not save contact name: {err}"));
+                        }
+                    }
+                    app.set_peer_name(name);
+                }
                 Some(NetEvent::Disconnected(reason)) => {
                     // The peer is already gone, so just tear down and re-open the lobby.
                     if let Some(live) = session.take() {

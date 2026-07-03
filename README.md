@@ -81,7 +81,9 @@ cargo run -- 96aedec725a0104933cfd73a2722b3497b13307100a242ccb47efe9cb1fafa39
 Your keys live in `$XDG_CONFIG_HOME/kiss_chat/` (falling back to `~/.config/kiss_chat/`),
 owner-readable only: `secret.key` is your iroh address and `auth.key` is your ML-DSA
 authentication seed. Delete them to rotate to a fresh identity; copy them to run as the same
-identity on another machine. An optional `name` file (not a secret) holds your display name.
+identity on another machine. Two non-secret files sit alongside them: an optional `name` file
+holds your display name, and `contacts` records the peers you've accepted (see
+[Remembering peers](#remembering-peers)).
 
 ### Verifying the peer
 
@@ -92,6 +94,28 @@ phone call, etc.), then `/accept` if every word matches in order or `/reject` if
 Verifying once is enough: the ML-DSA signatures in the handshake bind the session to that identity,
 so a man-in-the-middle would show a *different* phrase. Because the words also cover the ephemeral
 keys, they can't be precomputed offline, and `/safety` re-shows them at any time.
+
+### Remembering peers
+
+When you `/accept` a peer, kiss_chat pins their long-term ML-DSA identity key against their
+address in a small `contacts` file (trust-on-first-use). Next time you connect to that same
+address, the verify step tells you which of three cases you're in:
+
+- **first time** — this address is new, so compare the safety words with care;
+- **recognised** — the identity key matches the one you verified before, so you're talking to the
+  same peer you trusted last time;
+- **⚠ changed** — the identity key is *different* from the one you accepted before. That can be an
+  innocent identity reset, or it can be an impersonation attempt, so re-read every safety word
+  especially carefully before you `/accept`. Accepting adopts the new key as the pinned one.
+
+Once a peer shares a display name (which only happens after you've both accepted), kiss_chat caches
+it alongside their pin, so a recognised peer is identified by name at the verify step. `/contacts`
+lists everyone you've accepted — by name, with their address — so you can tell known peers apart at
+a glance and copy an address straight into `/connect`.
+
+Only the public identity key is stored (as a SHA-256 fingerprint), keyed by the public address and
+followed by the optional cached name, so the `contacts` file holds no secrets. Delete it to forget
+every peer and start fresh.
 
 ### In-app commands
 
@@ -104,6 +128,7 @@ The input line doubles as a command prompt:
 | `/reject` | reject the peer being verified and return to the lobby (alias `/r`) |
 | `/name [text]` | set your optional display name; empty clears it (alias `/n`) |
 | `/safety` | re-show the current session's safety words (alias `/s`) |
+| `/contacts` | list the peers you've accepted before (alias `/peers`) |
 | `/address` | show your own address to share (alias `/addr`) |
 | `/clear` | clear the screen |
 | `/help` | list commands (alias `/h`, `/?`) |
@@ -143,6 +168,7 @@ side dropping returns you to the lobby, where you can `/connect` to someone new.
 | Module | Responsibility |
 |--------|----------------|
 | `identity` | persistent on-disk keys (iroh address + ML-DSA auth seed) |
+| `contacts` | pinned contact list: remembers each accepted peer's ML-DSA key (TOFU) |
 | `transport` | iroh endpoint: bind, dial-by-key, accept (QUIC + NAT traversal) |
 | `proto` | length-prefixed framing over the stream |
 | `message` | 1-byte-tagged in-band protocol (chat text vs. a `Bye` control frame) |
@@ -183,9 +209,11 @@ identities) means the phrase can't be mined offline, so a MITM can't precompute 
   signatures bind the ephemeral keys to the identity key, so the out-of-band **safety words**
   check is what roots trust — verify it once and a MITM cannot impersonate that identity, even
   with a quantum computer.
-- kiss_chat does **not** persist a contact list, so peer identities are trusted on first use
-  (verified via the safety words). It re-verifies via signatures every session but will not, on
-  its own, warn you if a *previously seen* peer presents a new identity key.
+- Peer identities are trusted on first use (verified via the safety words) and then **pinned**:
+  when you `/accept` a peer, kiss_chat remembers their ML-DSA identity key against their address,
+  and warns you on a later connection if that address ever presents a *different* identity key.
+  Pinning only covers peers you've accepted, and it keys on the address, so a known peer arriving
+  from a brand-new address is treated as a first meeting rather than a change.
 - The `ml-kem` and `ml-dsa` crates are pure-Rust FIPS 203/204 implementations that have **not**
   had an independent security audit. Treat kiss_chat as a simple, educational P2P chat, not a
   hardened product.
@@ -202,6 +230,5 @@ connect → three-message authenticated handshake → encrypted round-trip.
 
 ## Not (yet) included
 
-Group chat, message history on disk, file transfer, a persistent contact list (identity-key
-pinning with change warnings), and local-time timestamps. The architecture leaves room for each
-without a rewrite.
+Group chat, message history on disk, file transfer, and local-time timestamps. The architecture
+leaves room for each without a rewrite.

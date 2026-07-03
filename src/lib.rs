@@ -22,6 +22,7 @@
 //! | `/connect <peer-id>` | dial a peer (switches peers if already connected) |
 //! | `/accept`, `/reject` | accept or reject a peer after comparing the safety words |
 //! | `/safety` | re-show the current session's safety words |
+//! | `/contacts` | list the peers you've accepted before |
 //! | `/name [text]` | set your (optional) display name; only shared after `/accept` |
 //! | `/clear` | clear the screen |
 //! | `/help` | list commands |
@@ -32,6 +33,7 @@
 //! | Module | Responsibility |
 //! | --- | --- |
 //! | [`identity`] | persistent on-disk keys (iroh address + ML-DSA auth seed) |
+//! | [`contacts`] | pinned contact list: remembers each peer's ML-DSA key (TOFU) |
 //! | [`transport`] | iroh: bind, dial-by-key, accept (handles NAT traversal) |
 //! | [`proto`] | length-prefixed framing over the QUIC stream |
 //! | [`message`] | the one-byte-tagged in-band protocol (chat text vs. `Bye` control) |
@@ -44,6 +46,7 @@
 //! This crate is a library (the modules above) paired with a thin binary
 //! (`src/main.rs`) that parses the command line and calls [`run`].
 
+pub mod contacts;
 pub mod crypto;
 pub mod identity;
 pub mod message;

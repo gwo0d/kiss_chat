@@ -123,7 +123,7 @@ fn load_or_create_key(
 
 /// The directory holding kiss_chat's keys: `$XDG_CONFIG_HOME/kiss_chat`, or
 /// `$HOME/.config/kiss_chat` when `XDG_CONFIG_HOME` is unset.
-fn config_dir() -> Result<PathBuf> {
+pub(crate) fn config_dir() -> Result<PathBuf> {
     let base = if let Some(xdg) = std::env::var_os("XDG_CONFIG_HOME") {
         PathBuf::from(xdg)
     } else {
