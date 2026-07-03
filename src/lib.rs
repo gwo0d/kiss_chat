@@ -22,6 +22,7 @@
 //! | `/connect <peer-id>` | dial a peer (switches peers if already connected) |
 //! | `/accept`, `/reject` | accept or reject a peer after comparing the safety words |
 //! | `/safety` | re-show the current session's safety words |
+//! | `/contacts` | list the peers you've accepted before |
 //! | `/name [text]` | set your (optional) display name; only shared after `/accept` |
 //! | `/clear` | clear the screen |
 //! | `/help` | list commands |

@@ -51,6 +51,8 @@ pub enum Action {
     Send(String),
     /// Set (or, with an empty string, clear) our own display name (from `/name`).
     SetName(String),
+    /// List the peers we've accepted before (from `/contacts`).
+    ListContacts,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -152,8 +154,15 @@ impl App {
     /// `pin` says how the peer's long-term identity key compares to any we pinned
     /// for this address on a previous `/accept`, so the user is told whether this is
     /// a first meeting, a recognised peer, or — the case that matters — one whose
-    /// identity key has changed since last time.
-    pub fn set_verifying(&mut self, peer_short: String, safety_number: String, pin: PinStatus) {
+    /// identity key has changed since last time. `known_name` is the display name we
+    /// cached for a recognised peer, shown so they can be identified at a glance.
+    pub fn set_verifying(
+        &mut self,
+        peer_short: String,
+        safety_number: String,
+        pin: PinStatus,
+        known_name: Option<String>,
+    ) {
         self.mode = Mode::Verifying;
         self.peer_short = peer_short;
         self.safety_number = safety_number.clone();
@@ -165,9 +174,13 @@ impl App {
             PinStatus::New => self.push_system(
                 "first time you've accepted this address — check the safety words with care.",
             ),
-            PinStatus::Known => self.push_system(
-                "recognised — this address's identity key matches the one you verified before.",
-            ),
+            PinStatus::Known => self.push_system(match &known_name {
+                Some(name) => format!(
+                    "recognised as \"{name}\" — this address's identity key matches the one you verified before."
+                ),
+                None => "recognised — this address's identity key matches the one you verified before."
+                    .to_string(),
+            }),
             PinStatus::Changed => {
                 self.push_warning(
                     "⚠ this address's identity key has CHANGED since you last accepted it.",
@@ -445,6 +458,9 @@ impl App {
                 self.push_system(format!("your address: {address}"));
                 Action::None
             }
+            // The contact list lives on disk, so the main loop reads it and reports
+            // back; usable in any mode, since it only reads.
+            "contacts" | "peers" => Action::ListContacts,
             "safety" | "s" => {
                 if self.safety_number.is_empty() {
                     self.push_system("no safety words yet — connect to a peer first");
@@ -475,6 +491,7 @@ impl App {
                     "  /name [text]         set your display name (empty clears); shared on /accept",
                 );
                 self.push_system("  /safety              re-show the current safety words");
+                self.push_system("  /contacts            list the peers you've accepted before");
                 self.push_system("  /address             show your own address to share");
                 self.push_system("  /clear               clear the screen");
                 self.push_system("  /help                show this help");
@@ -688,7 +705,7 @@ mod tests {
 
     // Drive the app into an accepted, connected session.
     fn reach_connected(app: &mut App) {
-        app.set_verifying("peer".into(), "ab-cd".into(), PinStatus::New);
+        app.set_verifying("peer".into(), "ab-cd".into(), PinStatus::New, None);
         let _ = submit_line(app, "/accept");
     }
 
@@ -716,7 +733,7 @@ mod tests {
     #[test]
     fn text_while_verifying_is_not_sent() {
         let mut app = App::new("my-addr".into());
-        app.set_verifying("peer".into(), "ab-cd".into(), PinStatus::New);
+        app.set_verifying("peer".into(), "ab-cd".into(), PinStatus::New, None);
         assert!(matches!(submit_line(&mut app, "hi"), Action::None));
     }
 
@@ -733,7 +750,7 @@ mod tests {
     #[test]
     fn reject_yields_reject_action() {
         let mut app = App::new("my-addr".into());
-        app.set_verifying("peer".into(), "ab-cd".into(), PinStatus::New);
+        app.set_verifying("peer".into(), "ab-cd".into(), PinStatus::New, None);
         assert!(matches!(
             submit_line(&mut app, "/reject"),
             Action::RejectPeer
@@ -743,14 +760,14 @@ mod tests {
     #[test]
     fn accept_while_verifying_yields_accept_action() {
         let mut app = App::new("my-addr".into());
-        app.set_verifying("peer".into(), "ab-cd".into(), PinStatus::New);
+        app.set_verifying("peer".into(), "ab-cd".into(), PinStatus::New, None);
         assert!(matches!(submit_line(&mut app, "/accept"), Action::Accept));
     }
 
     #[test]
     fn changed_identity_key_raises_a_warning_during_verification() {
         let mut app = App::new("my-addr".into());
-        app.set_verifying("peer".into(), "ab-cd".into(), PinStatus::Changed);
+        app.set_verifying("peer".into(), "ab-cd".into(), PinStatus::Changed, None);
         assert!(
             app.history
                 .iter()
@@ -762,7 +779,7 @@ mod tests {
     #[test]
     fn recognised_peer_is_noted_without_a_warning() {
         let mut app = App::new("my-addr".into());
-        app.set_verifying("peer".into(), "ab-cd".into(), PinStatus::Known);
+        app.set_verifying("peer".into(), "ab-cd".into(), PinStatus::Known, None);
         assert!(app.history.iter().any(|l| l.text.contains("recognised")));
         assert!(
             !app.history
@@ -770,6 +787,32 @@ mod tests {
                 .any(|l| matches!(l.author, Author::Warning)),
             "a matching key must not raise a warning"
         );
+    }
+
+    #[test]
+    fn recognised_peer_shows_its_cached_name() {
+        let mut app = App::new("my-addr".into());
+        app.set_verifying(
+            "peer".into(),
+            "ab-cd".into(),
+            PinStatus::Known,
+            Some("Alice".into()),
+        );
+        assert!(
+            app.history
+                .iter()
+                .any(|l| l.text.contains("recognised as \"Alice\"")),
+            "a recognised peer's cached name should be shown"
+        );
+    }
+
+    #[test]
+    fn contacts_command_yields_a_list_action() {
+        let mut app = App::new("my-addr".into());
+        assert!(matches!(
+            submit_line(&mut app, "/contacts"),
+            Action::ListContacts
+        ));
     }
 
     #[test]
@@ -843,7 +886,7 @@ mod tests {
     #[test]
     fn connect_is_refused_while_verifying() {
         let mut app = App::new("my-addr".into());
-        app.set_verifying("peer".into(), "ab-cd".into(), PinStatus::New);
+        app.set_verifying("peer".into(), "ab-cd".into(), PinStatus::New, None);
         assert!(matches!(
             submit_line(&mut app, "/connect abc"),
             Action::None

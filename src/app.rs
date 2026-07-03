@@ -68,6 +68,9 @@ struct LiveSession {
     /// that `/accept` can pin them to the contact list for trust-on-first-use.
     peer_id: String,
     peer_identity: Vec<u8>,
+    /// The peer's display name once they share it this session, cached so it can be
+    /// stored against their pin (for at-a-glance identification next time).
+    peer_name: Option<String>,
 }
 
 /// Print command-line usage to stdout.
@@ -79,6 +82,25 @@ pub fn print_usage() {
          \x20 kiss_chat <peer-id>    dial a peer immediately\n\n\
          inside the app: /connect <peer-id>, /accept, /reject, /name, /clear, /help, /quit"
     );
+}
+
+/// List the peers we've accepted before (name, if cached, and full address so it can
+/// be copied straight into `/connect`) into the message pane.
+fn list_contacts(app: &mut App) {
+    match contacts::known_peers() {
+        Ok(peers) if peers.is_empty() => {
+            app.push_system("no known peers yet — accepting a peer remembers them here");
+        }
+        Ok(peers) => {
+            let label = if peers.len() == 1 { "peer" } else { "peers" };
+            app.push_system(format!("{} known {label}:", peers.len()));
+            for peer in peers {
+                let name = peer.name.as_deref().unwrap_or("(unnamed)");
+                app.push_system(format!("  {name}  ·  {}", peer.address));
+            }
+        }
+        Err(err) => app.push_system(format!("could not read contacts: {err}")),
+    }
 }
 
 /// Bring up the application: bind the endpoint, load our persistent identity, take
@@ -188,6 +210,14 @@ async fn event_loop(
                             {
                                 app.push_system(format!("could not save contact: {err}"));
                             }
+                            // If the peer already shared a name (they accepted first),
+                            // cache it against the fresh pin now.
+                            if live.peer_name.is_some()
+                                && let Err(err) =
+                                    contacts::set_name(&live.peer_id, live.peer_name.as_deref())
+                            {
+                                app.push_system(format!("could not save contact name: {err}"));
+                            }
                             if let Some(name) = &my_name {
                                 let _ = live.outgoing_tx.send(Outgoing::Name(Some(name.clone())));
                             }
@@ -223,6 +253,7 @@ async fn event_loop(
                             let _ = live.outgoing_tx.send(Outgoing::Text(line));
                         }
                     }
+                    Action::ListContacts => list_contacts(&mut app),
                     Action::None => {}
                 }
             }
@@ -243,15 +274,15 @@ async fn event_loop(
 
                         // Compare the peer's long-term identity key against any we
                         // pinned for this address when we last accepted it (TOFU), so
-                        // the verify step can flag a first meeting, a recognised peer,
-                        // or — the case that matters — a changed identity key.
+                        // the verify step can flag a first meeting, a recognised peer
+                        // (by their cached name), or a changed identity key.
                         let peer_id = peer.to_string();
                         let peer_identity = new_session.peer_identity().to_vec();
-                        let pin = match contacts::status(&peer_id, &peer_identity) {
-                            Ok(status) => status,
+                        let (pin, known_name) = match contacts::recognize(&peer_id, &peer_identity) {
+                            Ok(rec) => (rec.status, rec.name),
                             Err(err) => {
                                 app.push_system(format!("could not read contacts: {err}"));
-                                PinStatus::New
+                                (PinStatus::New, None)
                             }
                         };
 
@@ -265,10 +296,11 @@ async fn event_loop(
                             writer: spawn_writer(send, sealer, out_rx),
                             peer_id,
                             peer_identity,
+                            peer_name: None,
                         });
                         // The channel is up, but hold chat until the user has compared
                         // the safety number out-of-band and accepted.
-                        app.set_verifying(peer.fmt_short().to_string(), safety_number, pin);
+                        app.set_verifying(peer.fmt_short().to_string(), safety_number, pin, known_name);
                     }
                 }
                 // Dial/accept failed: return to the lobby. Re-arm the listener only if
@@ -285,7 +317,19 @@ async fn event_loop(
 
             event = net_rx.recv(), if session.is_some() => match event {
                 Some(NetEvent::Message(text)) => app.push_peer(text),
-                Some(NetEvent::PeerName(name)) => app.set_peer_name(name),
+                Some(NetEvent::PeerName(name)) => {
+                    // Remember the name for this session, and — once we've accepted
+                    // the peer — cache it against their pin for next time.
+                    if let Some(live) = &mut session {
+                        live.peer_name = name.clone();
+                        if accepted
+                            && let Err(err) = contacts::set_name(&live.peer_id, name.as_deref())
+                        {
+                            app.push_system(format!("could not save contact name: {err}"));
+                        }
+                    }
+                    app.set_peer_name(name);
+                }
                 Some(NetEvent::Disconnected(reason)) => {
                     // The peer is already gone, so just tear down and re-open the lobby.
                     if let Some(live) = session.take() {

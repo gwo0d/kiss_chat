@@ -108,8 +108,14 @@ address, the verify step tells you which of three cases you're in:
   innocent identity reset, or it can be an impersonation attempt, so re-read every safety word
   especially carefully before you `/accept`. Accepting adopts the new key as the pinned one.
 
-Only the public identity key is stored (as a SHA-256 fingerprint), keyed by the public address, so
-the `contacts` file holds no secrets. Delete it to forget every peer and start fresh.
+Once a peer shares a display name (which only happens after you've both accepted), kiss_chat caches
+it alongside their pin, so a recognised peer is identified by name at the verify step. `/contacts`
+lists everyone you've accepted — by name, with their address — so you can tell known peers apart at
+a glance and copy an address straight into `/connect`.
+
+Only the public identity key is stored (as a SHA-256 fingerprint), keyed by the public address and
+followed by the optional cached name, so the `contacts` file holds no secrets. Delete it to forget
+every peer and start fresh.
 
 ### In-app commands
 
@@ -122,6 +128,7 @@ The input line doubles as a command prompt:
 | `/reject` | reject the peer being verified and return to the lobby (alias `/r`) |
 | `/name [text]` | set your optional display name; empty clears it (alias `/n`) |
 | `/safety` | re-show the current session's safety words (alias `/s`) |
+| `/contacts` | list the peers you've accepted before (alias `/peers`) |
 | `/address` | show your own address to share (alias `/addr`) |
 | `/clear` | clear the screen |
 | `/help` | list commands (alias `/h`, `/?`) |
