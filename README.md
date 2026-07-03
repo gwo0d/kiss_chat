@@ -174,8 +174,9 @@ Editing keys: <kbd>←</kbd>/<kbd>→</kbd>, <kbd>Home</kbd>/<kbd>End</kbd>, <kb
 (start/end). <kbd>PageUp</kbd>/<kbd>PageDown</kbd> scroll the history.
 
 Once accepted, both sides get the same chat view — type a line and press <kbd>Enter</kbd> to send.
-The status bar shows the connected peer; recall the **safety words** any time with `/safety`.
-Message timestamps are in UTC.
+To send a message that begins with a slash, double it: `//shrug` sends `/shrug`. The status bar
+shows the connected peer; recall the **safety words** any time with `/safety`. Message timestamps
+are in UTC.
 
 ### Display names
 

@@ -23,6 +23,7 @@
 //! | `/accept`, `/reject` | accept or reject a peer after comparing the safety words |
 //! | `/safety` | re-show the current session's safety words |
 //! | `/contacts` | list the peers you've accepted before |
+//! | `/address` | show your own address to share |
 //! | `/name [text]` | set your (optional) display name; only shared after `/accept` |
 //! | `/clear` | clear the screen |
 //! | `/help` | list commands |

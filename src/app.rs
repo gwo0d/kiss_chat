@@ -73,6 +73,15 @@ struct LiveSession {
     peer_name: Option<String>,
 }
 
+/// Terminal input forwarded from the blocking reader thread into the async loop.
+enum Input {
+    /// A key press to interpret.
+    Key(KeyEvent),
+    /// A terminal resize. Carries no data — it exists only to wake the loop so the
+    /// UI redraws at the new size (the draw happens at the top of every iteration).
+    Resize,
+}
+
 /// Print command-line usage to stdout.
 pub fn print_usage() {
     println!(
@@ -80,7 +89,8 @@ pub fn print_usage() {
          usage:\n\
          \x20 kiss_chat              listen in the lobby; share your address and wait\n\
          \x20 kiss_chat <peer-id>    dial a peer immediately\n\n\
-         inside the app: /connect <peer-id>, /accept, /reject, /name, /clear, /help, /quit"
+         inside the app: /connect <peer-id>, /accept, /reject, /name, /safety,\n\
+         \x20               /contacts, /address, /clear, /help, /quit"
     );
 }
 
@@ -144,15 +154,19 @@ async fn event_loop(
     let mut my_name = display_name;
     let mut accepted = false;
 
-    // Bridge blocking crossterm input into async on a dedicated thread.
-    let (input_tx, mut input_rx) = mpsc::unbounded_channel::<KeyEvent>();
+    // Bridge blocking crossterm input into async on a dedicated thread. Both key
+    // presses and resizes are forwarded; a resize just wakes the loop to redraw.
+    let (input_tx, mut input_rx) = mpsc::unbounded_channel::<Input>();
     std::thread::spawn(move || {
         while let Ok(event) = crossterm::event::read() {
-            if let Event::Key(key) = event {
+            let forward = match event {
                 // Ignore key-release/repeat noise (notably on Windows).
-                if key.kind == KeyEventKind::Press && input_tx.send(key).is_err() {
-                    break;
-                }
+                Event::Key(key) if key.kind == KeyEventKind::Press => Input::Key(key),
+                Event::Resize(..) => Input::Resize,
+                _ => continue,
+            };
+            if input_tx.send(forward).is_err() {
+                break;
             }
         }
     });
@@ -183,8 +197,13 @@ async fn event_loop(
         }
 
         tokio::select! {
-            key = input_rx.recv() => {
-                let Some(key) = key else { break }; // input thread ended
+            input = input_rx.recv() => {
+                let Some(input) = input else { break }; // input thread ended
+                let key = match input {
+                    Input::Key(key) => key,
+                    // A resize needs only a redraw, done at the top of the next loop.
+                    Input::Resize => continue,
+                };
                 match app.on_key(key) {
                     Action::Quit => break,
                     Action::Connect(id) => match EndpointId::from_str(id.trim()) {
@@ -208,6 +227,9 @@ async fn event_loop(
                     Action::Accept => {
                         // Now — and only now — is it safe to share our display name.
                         accepted = true;
+                        // A name the peer volunteered before we accepted was recorded
+                        // but held back from the verify screen; surface it now.
+                        let mut peer_name_to_show = None;
                         if let Some(live) = &session {
                             // Pin (or re-pin) this peer's identity key so a future
                             // change is flagged. Accepting is the user asserting trust.
@@ -217,15 +239,22 @@ async fn event_loop(
                             }
                             // If the peer already shared a name (they accepted first),
                             // cache it against the fresh pin now.
-                            if live.peer_name.is_some()
-                                && let Err(err) =
+                            if live.peer_name.is_some() {
+                                if let Err(err) =
                                     contacts::set_name(&live.peer_id, live.peer_name.as_deref())
-                            {
-                                app.push_system(format!("could not save contact name: {err}"));
+                                {
+                                    app.push_system(format!(
+                                        "could not save contact name: {err}"
+                                    ));
+                                }
+                                peer_name_to_show = live.peer_name.clone();
                             }
                             if let Some(name) = &my_name {
                                 let _ = live.outgoing_tx.send(Outgoing::Name(Some(name.clone())));
                             }
+                        }
+                        if peer_name_to_show.is_some() {
+                            app.set_peer_name(peer_name_to_show);
                         }
                     }
                     Action::RejectPeer => {
@@ -323,10 +352,20 @@ async fn event_loop(
             },
 
             event = net_rx.recv(), if session.is_some() => match event {
-                Some(NetEvent::Message(text)) => app.push_peer(text),
+                // Until we've accepted the peer, suppress anything they send: a
+                // well-behaved client stays silent through our verify gate, and a
+                // malicious one must not be able to paint chat text — "it's me, just
+                // accept!" — onto the very screen where the safety-word ritual matters
+                // most. A name they volunteer is still *recorded* (so it can be cached
+                // against their pin the moment we accept), but not shown.
+                Some(NetEvent::Message(text)) => {
+                    if accepted {
+                        app.push_peer(text);
+                    }
+                }
                 Some(NetEvent::PeerName(name)) => {
                     // Remember the name for this session, and — once we've accepted
-                    // the peer — cache it against their pin for next time.
+                    // the peer — cache it against their pin for next time and show it.
                     if let Some(live) = &mut session {
                         live.peer_name = name.clone();
                         if accepted
@@ -335,7 +374,9 @@ async fn event_loop(
                             app.push_system(format!("could not save contact name: {err}"));
                         }
                     }
-                    app.set_peer_name(name);
+                    if accepted {
+                        app.set_peer_name(name);
+                    }
                 }
                 Some(NetEvent::Disconnected(reason)) => {
                     // The peer is already gone, so just tear down and re-open the lobby.

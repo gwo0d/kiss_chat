@@ -15,6 +15,7 @@
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 
 use crate::contacts::PinStatus;
+use crate::message;
 use ratatui::{
     Frame,
     layout::{Constraint, Layout},
@@ -185,7 +186,7 @@ impl App {
     ///     the safety words adds nothing; we ask only for a light consent to reconnect,
     ///     while still leaving the words a `/safety` away for the cautious.
     ///
-    /// Either way the channel is held in [`Mode::Verifying`] until the user `/accept`s,
+    /// Either way the channel is held in the verify gate until the user `/accept`s,
     /// so a peer can never force us into a chat without our say-so. `known_name` is the
     /// name cached for a recognised peer, shown so they're identifiable at a glance.
     pub fn set_verifying(
@@ -441,16 +442,33 @@ impl App {
     // --- command handling --------------------------------------------------
 
     fn submit(&mut self) -> Action {
-        let line = self.input.trim().to_string();
+        let mut line = self.input.trim().to_string();
         self.clear_input();
         if line.is_empty() {
             return Action::None;
         }
-        if let Some(command) = line.strip_prefix('/') {
-            return self.run_command(command);
+        // A single leading slash is a command. A doubled one (`//`) escapes it, so a
+        // message that genuinely starts with a slash — "//shrug" — can be sent as
+        // "/shrug" rather than parsed as a command.
+        if let Some(rest) = line.strip_prefix('/') {
+            if rest.starts_with('/') {
+                line.remove(0); // drop one slash; send the rest as an ordinary message
+            } else {
+                return self.run_command(rest);
+            }
         }
         match self.mode {
             Mode::Connected => {
+                // Cap the length before echoing or sending: an over-long line would
+                // otherwise be a frame the peer rejects, tearing down their session.
+                let len = line.chars().count();
+                if len > message::MAX_MESSAGE_CHARS {
+                    self.push_system(format!(
+                        "message too long ({len} characters, max {}) — not sent",
+                        message::MAX_MESSAGE_CHARS
+                    ));
+                    return Action::None;
+                }
                 self.push(Author::You, line.clone());
                 Action::Send(line)
             }
@@ -562,8 +580,9 @@ impl App {
                 self.push_system("  /clear               clear the screen");
                 self.push_system("  /help                show this help");
                 self.push_system("  /quit                exit (or Esc / Ctrl-C)");
+                self.push_system("  //text               send a message that begins with a slash");
                 self.push_system(
-                    "keys: PageUp/PageDown scroll · Home/End, Ctrl-U/W edit the input",
+                    "keys: ←/→ Home/End move · Ctrl-A/Ctrl-E start/end · Ctrl-U/W edit · PageUp/PageDown scroll",
                 );
                 Action::None
             }
@@ -885,6 +904,60 @@ mod tests {
             Action::Send(line) => assert_eq!(line, "hi there"),
             _ => panic!("expected Send after /accept"),
         }
+    }
+
+    #[test]
+    fn an_over_long_message_is_refused_not_sent() {
+        // A line past the cap must not be echoed or sent — otherwise it becomes a
+        // frame the peer rejects, tearing their session down.
+        let mut app = App::new("my-addr".into());
+        reach_connected(&mut app);
+        let long = "a".repeat(message::MAX_MESSAGE_CHARS + 1);
+        assert!(matches!(submit_line(&mut app, &long), Action::None));
+        assert!(
+            app.history.iter().any(|l| l.text.contains("too long")),
+            "the user should be told the message was too long"
+        );
+        // A "you:" echo must not have been recorded for the refused line.
+        assert!(
+            !app.history.iter().any(|l| matches!(l.author, Author::You)),
+            "a refused message must not be echoed locally"
+        );
+    }
+
+    #[test]
+    fn double_slash_escapes_a_leading_slash_in_a_message() {
+        // "//shrug" must be sent verbatim as "/shrug", not parsed as a command.
+        let mut app = App::new("my-addr".into());
+        reach_connected(&mut app);
+        match submit_line(&mut app, "//shrug") {
+            Action::Send(line) => assert_eq!(line, "/shrug"),
+            _ => panic!("expected the escaped line to be sent as a message"),
+        }
+        // The local echo carries the de-escaped text too.
+        assert!(
+            app.history
+                .iter()
+                .any(|l| matches!(l.author, Author::You) && l.text == "/shrug")
+        );
+    }
+
+    #[test]
+    fn a_single_slash_still_routes_as_a_command() {
+        // The escape must not disturb ordinary command parsing.
+        let mut app = App::new("my-addr".into());
+        match submit_line(&mut app, "/connect abc123") {
+            Action::Connect(id) => assert_eq!(id, "abc123"),
+            _ => panic!("expected a single slash to route as a command"),
+        }
+    }
+
+    #[test]
+    fn a_message_at_the_cap_is_sent() {
+        let mut app = App::new("my-addr".into());
+        reach_connected(&mut app);
+        let at_cap = "a".repeat(message::MAX_MESSAGE_CHARS);
+        assert!(matches!(submit_line(&mut app, &at_cap), Action::Send(_)));
     }
 
     #[test]

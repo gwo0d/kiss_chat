@@ -15,12 +15,22 @@ const MAX_FRAME: usize = 64 * 1024;
 
 /// Write one length-prefixed frame.
 ///
+/// Enforces the same `MAX_FRAME` cap the reader does, so the invariant is symmetric:
+/// we never put a frame on the wire that the peer would reject (and tear the session
+/// down over). Legitimate frames — handshake messages and length-capped chat lines —
+/// are comfortably under the limit, so this only ever fires on a bug.
+///
 /// # Errors
 ///
-/// Fails if `data` is larger than a `u32` length prefix can express, or the
-/// underlying stream write fails.
+/// Fails if `data` exceeds `MAX_FRAME`, or the underlying stream write fails.
 pub async fn write_frame(send: &mut SendStream, data: &[u8]) -> Result<()> {
-    let len = u32::try_from(data.len()).map_err(|_| anyhow::anyhow!("frame too large to send"))?;
+    ensure!(
+        data.len() <= MAX_FRAME,
+        "refusing to send oversized frame: {} bytes (max {MAX_FRAME})",
+        data.len()
+    );
+    // Lossless: data.len() <= MAX_FRAME, which is far below u32::MAX.
+    let len = data.len() as u32;
     send.write_all(&len.to_be_bytes()).await?;
     send.write_all(data).await?;
     Ok(())
@@ -31,7 +41,7 @@ pub async fn write_frame(send: &mut SendStream, data: &[u8]) -> Result<()> {
 /// # Errors
 ///
 /// Fails if the stream ends before a full frame arrives, or the peer's length
-/// prefix exceeds [`MAX_FRAME`].
+/// prefix exceeds `MAX_FRAME`.
 pub async fn read_frame(recv: &mut RecvStream) -> Result<Vec<u8>> {
     let mut len_buf = [0u8; 4];
     recv.read_exact(&mut len_buf).await?;

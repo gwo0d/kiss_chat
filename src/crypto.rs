@@ -206,6 +206,13 @@ impl Initiator {
             .map_err(|_| anyhow!("malformed ML-KEM ciphertext"))?;
         let ss_kem = self.dk.decapsulate(&ct);
         let ss_dh = self.x_secret.diffie_hellman(&x25519_public(their_x)?);
+        // Reject a low-order X25519 key, which would force an all-zero DH share.
+        // Defence in depth: the ML-KEM secret and signed transcript already protect
+        // the session key, but a contributory exchange is one line to guarantee.
+        ensure!(
+            ss_dh.was_contributory(),
+            "peer sent a non-contributory (low-order) X25519 key"
+        );
 
         // msg2's transcript contribution excludes the signature that signs it.
         let msg2_core_len = MLKEM_CT_LEN + X25519_LEN + MLDSA_VK_LEN;
@@ -266,6 +273,11 @@ pub fn responder_receive(
     let x_secret = StaticSecret::from(random_bytes());
     let x_pub = PublicKey::from(&x_secret);
     let ss_dh = x_secret.diffie_hellman(&x25519_public(their_x)?);
+    // Reject a low-order X25519 key (see the initiator side for the rationale).
+    ensure!(
+        ss_dh.was_contributory(),
+        "peer sent a non-contributory (low-order) X25519 key"
+    );
 
     let mut msg2_core = ct.as_slice().to_vec();
     msg2_core.extend_from_slice(x_pub.as_bytes());
@@ -683,6 +695,39 @@ mod tests {
         assert!(
             pending.finish(&msg3).is_err(),
             "responder must reject a bad initiator signature"
+        );
+    }
+
+    #[test]
+    fn a_low_order_initiator_x25519_key_is_rejected() {
+        // A peer offering a low-order point (here the all-zero public key) would force
+        // an all-zero DH share; the responder's contributory check must reject it.
+        let initiator = initiator_start(identity(1));
+        let mut msg1 = initiator.msg1().to_vec();
+        // Zero the X25519 field: msg1 = ek || x25519 || vk_I.
+        for byte in &mut msg1[MLKEM_EK_LEN..MLKEM_EK_LEN + X25519_LEN] {
+            *byte = 0;
+        }
+        assert!(
+            responder_receive(&msg1, &[1; 32], &[2; 32], identity(2)).is_err(),
+            "a low-order initiator X25519 key must fail the handshake"
+        );
+    }
+
+    #[test]
+    fn a_low_order_responder_x25519_key_is_rejected() {
+        // The mirror case: the initiator must reject a low-order key in msg2. The
+        // contributory check runs before signature verification, so it fires first.
+        let initiator = initiator_start(identity(1));
+        let (_pending, mut msg2) =
+            responder_receive(initiator.msg1(), &[1; 32], &[2; 32], identity(2)).unwrap();
+        // Zero the X25519 field: msg2 = ct || x25519 || vk_R || sig_R.
+        for byte in &mut msg2[MLKEM_CT_LEN..MLKEM_CT_LEN + X25519_LEN] {
+            *byte = 0;
+        }
+        assert!(
+            initiator.finish(&msg2, &[1; 32], &[2; 32]).is_err(),
+            "a low-order responder X25519 key must fail the handshake"
         );
     }
 
