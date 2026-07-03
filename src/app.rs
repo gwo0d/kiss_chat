@@ -89,7 +89,8 @@ pub fn print_usage() {
          usage:\n\
          \x20 kiss_chat              listen in the lobby; share your address and wait\n\
          \x20 kiss_chat <peer-id>    dial a peer immediately\n\n\
-         inside the app: /connect <peer-id>, /accept, /reject, /name, /clear, /help, /quit"
+         inside the app: /connect <peer-id>, /accept, /reject, /name, /safety,\n\
+         \x20               /contacts, /address, /clear, /help, /quit"
     );
 }
 

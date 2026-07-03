@@ -442,13 +442,20 @@ impl App {
     // --- command handling --------------------------------------------------
 
     fn submit(&mut self) -> Action {
-        let line = self.input.trim().to_string();
+        let mut line = self.input.trim().to_string();
         self.clear_input();
         if line.is_empty() {
             return Action::None;
         }
-        if let Some(command) = line.strip_prefix('/') {
-            return self.run_command(command);
+        // A single leading slash is a command. A doubled one (`//`) escapes it, so a
+        // message that genuinely starts with a slash — "//shrug" — can be sent as
+        // "/shrug" rather than parsed as a command.
+        if let Some(rest) = line.strip_prefix('/') {
+            if rest.starts_with('/') {
+                line.remove(0); // drop one slash; send the rest as an ordinary message
+            } else {
+                return self.run_command(rest);
+            }
         }
         match self.mode {
             Mode::Connected => {
@@ -573,8 +580,9 @@ impl App {
                 self.push_system("  /clear               clear the screen");
                 self.push_system("  /help                show this help");
                 self.push_system("  /quit                exit (or Esc / Ctrl-C)");
+                self.push_system("  //text               send a message that begins with a slash");
                 self.push_system(
-                    "keys: PageUp/PageDown scroll · Home/End, Ctrl-U/W edit the input",
+                    "keys: ←/→ Home/End move · Ctrl-A/Ctrl-E start/end · Ctrl-U/W edit · PageUp/PageDown scroll",
                 );
                 Action::None
             }
@@ -901,6 +909,33 @@ mod tests {
             !app.history.iter().any(|l| matches!(l.author, Author::You)),
             "a refused message must not be echoed locally"
         );
+    }
+
+    #[test]
+    fn double_slash_escapes_a_leading_slash_in_a_message() {
+        // "//shrug" must be sent verbatim as "/shrug", not parsed as a command.
+        let mut app = App::new("my-addr".into());
+        reach_connected(&mut app);
+        match submit_line(&mut app, "//shrug") {
+            Action::Send(line) => assert_eq!(line, "/shrug"),
+            _ => panic!("expected the escaped line to be sent as a message"),
+        }
+        // The local echo carries the de-escaped text too.
+        assert!(
+            app.history
+                .iter()
+                .any(|l| matches!(l.author, Author::You) && l.text == "/shrug")
+        );
+    }
+
+    #[test]
+    fn a_single_slash_still_routes_as_a_command() {
+        // The escape must not disturb ordinary command parsing.
+        let mut app = App::new("my-addr".into());
+        match submit_line(&mut app, "/connect abc123") {
+            Action::Connect(id) => assert_eq!(id, "abc123"),
+            _ => panic!("expected a single slash to route as a command"),
+        }
     }
 
     #[test]
