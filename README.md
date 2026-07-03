@@ -1,9 +1,9 @@
 <div align="center">
 
 <picture>
-  <source media="(prefers-color-scheme: dark)" srcset="assets/lockup-dark.svg">
-  <source media="(prefers-color-scheme: light)" srcset="assets/lockup-light.svg">
-  <img alt="kiss_chat" src="assets/lockup-light.svg" width="440">
+  <source media="(prefers-color-scheme: dark)" srcset="https://raw.githubusercontent.com/gwo0d/kiss_chat/main/assets/lockup-dark.svg">
+  <source media="(prefers-color-scheme: light)" srcset="https://raw.githubusercontent.com/gwo0d/kiss_chat/main/assets/lockup-light.svg">
+  <img alt="kiss_chat" src="https://raw.githubusercontent.com/gwo0d/kiss_chat/main/assets/lockup-light.svg" width="440">
 </picture>
 
 </div>
