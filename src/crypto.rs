@@ -213,7 +213,8 @@ impl Initiator {
         let key = derive_key(ss_kem.as_slice(), ss_dh.as_bytes(), &transcript);
         let safety = safety_number(&transcript);
         let sig_i = self.identity.sign(&digest);
-        Ok((Session::new(key, Role::Initiator, safety), sig_i))
+        let session = Session::new(key, Role::Initiator, safety, responder_vk.to_vec());
+        Ok((session, sig_i))
     }
 }
 
@@ -261,7 +262,7 @@ pub fn responder_receive(
 
     let key = derive_key(ss_kem.as_slice(), ss_dh.as_bytes(), &transcript);
     let safety = safety_number(&transcript);
-    let session = Session::new(key, Role::Responder, safety);
+    let session = Session::new(key, Role::Responder, safety, initiator_vk.to_vec());
 
     let mut msg2 = msg2_core;
     msg2.extend_from_slice(&identity.sign(&digest));
@@ -412,6 +413,9 @@ pub struct Session {
     key: [u8; 32],
     role: Role,
     safety_number: String,
+    /// The peer's long-term ML-DSA verifying key, as presented and verified in the
+    /// handshake. Stable across sessions with the same peer, so it can be pinned.
+    peer_identity: Vec<u8>,
 }
 
 impl Drop for Session {
@@ -423,11 +427,12 @@ impl Drop for Session {
 }
 
 impl Session {
-    fn new(key: [u8; 32], role: Role, safety_number: String) -> Self {
+    fn new(key: [u8; 32], role: Role, safety_number: String, peer_identity: Vec<u8>) -> Self {
         Self {
             key,
             role,
             safety_number,
+            peer_identity,
         }
     }
 
@@ -435,6 +440,15 @@ impl Session {
     /// Identical on both ends when the channel is genuine.
     pub fn safety_number(&self) -> &str {
         &self.safety_number
+    }
+
+    /// The peer's long-term ML-DSA verifying key, verified during the handshake.
+    ///
+    /// This is the peer's *stable* identity (unlike the per-session safety number,
+    /// which folds in fresh ephemeral keys). Pinning it against the peer's address
+    /// lets [`crate::contacts`] flag a later identity-key change.
+    pub fn peer_identity(&self) -> &[u8] {
+        &self.peer_identity
     }
 
     /// Split into directional halves. The direction tags depend on our role so
@@ -567,6 +581,16 @@ mod tests {
         let (a, b) = handshake();
         assert_eq!(a.key, b.key, "session keys must match");
         assert_eq!(a.safety_number(), b.safety_number());
+    }
+
+    #[test]
+    fn each_side_learns_the_peers_long_term_identity() {
+        // handshake() runs identity(1) as initiator and identity(2) as responder,
+        // so each session should expose the *other* side's verifying key.
+        let (init, resp) = handshake();
+        assert_eq!(init.peer_identity(), identity(2).public_bytes());
+        assert_eq!(resp.peer_identity(), identity(1).public_bytes());
+        assert_ne!(init.peer_identity(), resp.peer_identity());
     }
 
     #[test]

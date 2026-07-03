@@ -15,10 +15,11 @@ use ratatui::DefaultTerminal;
 use tokio::sync::mpsc::{self, Sender, UnboundedReceiver, UnboundedSender};
 use tokio::task::JoinHandle;
 
+use crate::contacts::PinStatus;
 use crate::crypto::{Opener, Sealer, Session};
 use crate::message::Outgoing;
 use crate::ui::{Action, App, NetEvent};
-use crate::{crypto, identity, message, proto, transport};
+use crate::{contacts, crypto, identity, message, proto, transport};
 
 /// How long to wait for a peer to acknowledge our goodbye before closing anyway.
 const FAREWELL_TIMEOUT: Duration = Duration::from_secs(1);
@@ -63,6 +64,10 @@ struct LiveSession {
     outgoing_tx: UnboundedSender<Outgoing>,
     reader: JoinHandle<()>,
     writer: JoinHandle<()>,
+    /// The peer's iroh address (as text) and long-term ML-DSA identity key, kept so
+    /// that `/accept` can pin them to the contact list for trust-on-first-use.
+    peer_id: String,
+    peer_identity: Vec<u8>,
 }
 
 /// Print command-line usage to stdout.
@@ -176,8 +181,16 @@ async fn event_loop(
                     Action::Accept => {
                         // Now — and only now — is it safe to share our display name.
                         accepted = true;
-                        if let (Some(live), Some(name)) = (&session, &my_name) {
-                            let _ = live.outgoing_tx.send(Outgoing::Name(Some(name.clone())));
+                        if let Some(live) = &session {
+                            // Pin (or re-pin) this peer's identity key so a future
+                            // change is flagged. Accepting is the user asserting trust.
+                            if let Err(err) = contacts::remember(&live.peer_id, &live.peer_identity)
+                            {
+                                app.push_system(format!("could not save contact: {err}"));
+                            }
+                            if let Some(name) = &my_name {
+                                let _ = live.outgoing_tx.send(Outgoing::Name(Some(name.clone())));
+                            }
                         }
                     }
                     Action::RejectPeer => {
@@ -227,6 +240,21 @@ async fn event_loop(
 
                         // Fresh channel: not yet accepted, so no name is shared.
                         accepted = false;
+
+                        // Compare the peer's long-term identity key against any we
+                        // pinned for this address when we last accepted it (TOFU), so
+                        // the verify step can flag a first meeting, a recognised peer,
+                        // or — the case that matters — a changed identity key.
+                        let peer_id = peer.to_string();
+                        let peer_identity = new_session.peer_identity().to_vec();
+                        let pin = match contacts::status(&peer_id, &peer_identity) {
+                            Ok(status) => status,
+                            Err(err) => {
+                                app.push_system(format!("could not read contacts: {err}"));
+                                PinStatus::New
+                            }
+                        };
+
                         let safety_number = new_session.safety_number().to_string();
                         let (sealer, opener) = new_session.split();
                         let (out_tx, out_rx) = mpsc::unbounded_channel::<Outgoing>();
@@ -235,10 +263,12 @@ async fn event_loop(
                             outgoing_tx: out_tx,
                             reader: spawn_reader(recv, opener, net_tx.clone()),
                             writer: spawn_writer(send, sealer, out_rx),
+                            peer_id,
+                            peer_identity,
                         });
                         // The channel is up, but hold chat until the user has compared
                         // the safety number out-of-band and accepted.
-                        app.set_verifying(peer.fmt_short().to_string(), safety_number);
+                        app.set_verifying(peer.fmt_short().to_string(), safety_number, pin);
                     }
                 }
                 // Dial/accept failed: return to the lobby. Re-arm the listener only if

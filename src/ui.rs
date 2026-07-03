@@ -12,6 +12,8 @@
 //! Timestamps shown next to messages are in UTC.
 
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+
+use crate::contacts::PinStatus;
 use ratatui::{
     Frame,
     layout::{Constraint, Layout},
@@ -63,6 +65,9 @@ enum Author {
     You,
     Peer,
     System,
+    /// A security-relevant notice (e.g. a peer's identity key changed), styled to
+    /// stand out from ordinary system chatter.
+    Warning,
 }
 
 struct ChatLine {
@@ -126,6 +131,10 @@ impl App {
         self.push(Author::System, text.into());
     }
 
+    fn push_warning(&mut self, text: impl Into<String>) {
+        self.push(Author::Warning, text.into());
+    }
+
     pub fn push_peer(&mut self, text: String) {
         self.push(Author::Peer, text);
     }
@@ -139,7 +148,12 @@ impl App {
 
     /// Enter the verify step once a channel is established: the safety words must
     /// be compared out-of-band before chatting begins.
-    pub fn set_verifying(&mut self, peer_short: String, safety_number: String) {
+    ///
+    /// `pin` says how the peer's long-term identity key compares to any we pinned
+    /// for this address on a previous `/accept`, so the user is told whether this is
+    /// a first meeting, a recognised peer, or — the case that matters — one whose
+    /// identity key has changed since last time.
+    pub fn set_verifying(&mut self, peer_short: String, safety_number: String, pin: PinStatus) {
         self.mode = Mode::Verifying;
         self.peer_short = peer_short;
         self.safety_number = safety_number.clone();
@@ -147,6 +161,25 @@ impl App {
         self.peer_name = None;
         self.status = format!("verify {} · compare the safety words", self.peer_short);
         self.push_system("channel up — now verify you're talking to the right person:");
+        match pin {
+            PinStatus::New => self.push_system(
+                "first time you've accepted this address — check the safety words with care.",
+            ),
+            PinStatus::Known => self.push_system(
+                "recognised — this address's identity key matches the one you verified before.",
+            ),
+            PinStatus::Changed => {
+                self.push_warning(
+                    "⚠ this address's identity key has CHANGED since you last accepted it.",
+                );
+                self.push_warning(
+                    "that can mean the peer reset their identity — or that someone is impersonating them.",
+                );
+                self.push_warning(
+                    "re-check every safety word especially carefully before you /accept.",
+                );
+            }
+        }
         self.push_system(format!("  safety words:  {safety_number}"));
         self.push_system("read them aloud with your peer over a trusted channel — every word");
         self.push_system("must match, in order. The safety words are what you trust, not names.");
@@ -540,6 +573,7 @@ fn wrapped_lines(line: &ChatLine, width: usize, peer_name: Option<&str>) -> Vec<
         Author::You => ("you", Color::Cyan),
         Author::Peer => (peer_name.unwrap_or("peer"), Color::Green),
         Author::System => ("--", Color::DarkGray),
+        Author::Warning => ("!!", Color::Red),
     };
     let time = format!("{} ", line.timestamp);
     let head = format!("{label}: ");
@@ -549,6 +583,11 @@ fn wrapped_lines(line: &ChatLine, width: usize, peer_name: Option<&str>) -> Vec<
 
     let time_style = Style::new().fg(Color::DarkGray);
     let head_style = Style::new().fg(color).add_modifier(Modifier::BOLD);
+    // A warning colours its whole body, not just the label, so it can't be skimmed past.
+    let body_style = match line.author {
+        Author::Warning => Style::new().fg(Color::Red),
+        _ => Style::new(),
+    };
 
     let chunks = wrap_text(&line.text, avail);
     if chunks.is_empty() {
@@ -565,10 +604,13 @@ fn wrapped_lines(line: &ChatLine, width: usize, peer_name: Option<&str>) -> Vec<
                 Line::from(vec![
                     Span::styled(time.clone(), time_style),
                     Span::styled(head.clone(), head_style),
-                    Span::raw(chunk),
+                    Span::styled(chunk, body_style),
                 ])
             } else {
-                Line::from(vec![Span::raw(indent.clone()), Span::raw(chunk)])
+                Line::from(vec![
+                    Span::raw(indent.clone()),
+                    Span::styled(chunk, body_style),
+                ])
             }
         })
         .collect()
@@ -646,7 +688,7 @@ mod tests {
 
     // Drive the app into an accepted, connected session.
     fn reach_connected(app: &mut App) {
-        app.set_verifying("peer".into(), "ab-cd".into());
+        app.set_verifying("peer".into(), "ab-cd".into(), PinStatus::New);
         let _ = submit_line(app, "/accept");
     }
 
@@ -674,7 +716,7 @@ mod tests {
     #[test]
     fn text_while_verifying_is_not_sent() {
         let mut app = App::new("my-addr".into());
-        app.set_verifying("peer".into(), "ab-cd".into());
+        app.set_verifying("peer".into(), "ab-cd".into(), PinStatus::New);
         assert!(matches!(submit_line(&mut app, "hi"), Action::None));
     }
 
@@ -691,7 +733,7 @@ mod tests {
     #[test]
     fn reject_yields_reject_action() {
         let mut app = App::new("my-addr".into());
-        app.set_verifying("peer".into(), "ab-cd".into());
+        app.set_verifying("peer".into(), "ab-cd".into(), PinStatus::New);
         assert!(matches!(
             submit_line(&mut app, "/reject"),
             Action::RejectPeer
@@ -701,8 +743,33 @@ mod tests {
     #[test]
     fn accept_while_verifying_yields_accept_action() {
         let mut app = App::new("my-addr".into());
-        app.set_verifying("peer".into(), "ab-cd".into());
+        app.set_verifying("peer".into(), "ab-cd".into(), PinStatus::New);
         assert!(matches!(submit_line(&mut app, "/accept"), Action::Accept));
+    }
+
+    #[test]
+    fn changed_identity_key_raises_a_warning_during_verification() {
+        let mut app = App::new("my-addr".into());
+        app.set_verifying("peer".into(), "ab-cd".into(), PinStatus::Changed);
+        assert!(
+            app.history
+                .iter()
+                .any(|l| matches!(l.author, Author::Warning) && l.text.contains("CHANGED")),
+            "a changed identity key must surface a warning line"
+        );
+    }
+
+    #[test]
+    fn recognised_peer_is_noted_without_a_warning() {
+        let mut app = App::new("my-addr".into());
+        app.set_verifying("peer".into(), "ab-cd".into(), PinStatus::Known);
+        assert!(app.history.iter().any(|l| l.text.contains("recognised")));
+        assert!(
+            !app.history
+                .iter()
+                .any(|l| matches!(l.author, Author::Warning)),
+            "a matching key must not raise a warning"
+        );
     }
 
     #[test]
@@ -776,7 +843,7 @@ mod tests {
     #[test]
     fn connect_is_refused_while_verifying() {
         let mut app = App::new("my-addr".into());
-        app.set_verifying("peer".into(), "ab-cd".into());
+        app.set_verifying("peer".into(), "ab-cd".into(), PinStatus::New);
         assert!(matches!(
             submit_line(&mut app, "/connect abc"),
             Action::None
