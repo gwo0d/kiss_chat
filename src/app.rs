@@ -108,6 +108,11 @@ fn list_contacts(app: &mut App) {
 /// always restored before returning, even if the loop errors out.
 ///
 /// `peer_arg` is an optional peer id (an iroh [`EndpointId`]) to dial on startup.
+///
+/// # Errors
+///
+/// Fails if the endpoint can't bind or the persistent identity can't be loaded;
+/// the terminal is always restored before returning, error or not.
 pub async fn run(peer_arg: Option<String>) -> Result<()> {
     let endpoint = transport::bind().await?;
     let auth_seed = identity::load_or_create_auth_seed()?;
