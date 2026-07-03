@@ -50,6 +50,7 @@ const TAG_BYE: u8 = 1;
 const TAG_NAME: u8 = 2;
 
 /// Encode an outgoing message into the plaintext that will be sealed.
+#[must_use]
 pub fn encode(message: &Outgoing) -> Vec<u8> {
     match message {
         Outgoing::Text(text) => {
@@ -70,6 +71,7 @@ pub fn encode(message: &Outgoing) -> Vec<u8> {
 }
 
 /// Decode a decrypted plaintext frame received from the peer.
+#[must_use]
 pub fn decode(plaintext: &[u8]) -> Incoming {
     match plaintext.split_first() {
         Some((&TAG_TEXT, body)) => Incoming::Text(sanitize_text(&String::from_utf8_lossy(body))),
@@ -104,6 +106,7 @@ fn is_bidi_or_invisible(c: char) -> bool {
 /// right-to-left override into our terminal), trims surrounding whitespace, and
 /// caps the length. Returns `None` when nothing usable is left — the caller
 /// treats that as "no display name".
+#[must_use]
 pub fn sanitize_name(raw: &str) -> Option<String> {
     let cleaned: String = raw
         .chars()

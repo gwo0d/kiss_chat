@@ -79,6 +79,11 @@ struct Contact {
 
 /// Look a connecting peer up in the contact list: classify its identity key and
 /// return the display name we last cached for that address.
+///
+/// # Errors
+///
+/// Fails if the config directory can't be located or the contacts file exists but
+/// can't be read.
 pub fn recognize(address: &str, identity_key: &[u8]) -> Result<Recognition> {
     recognize_in(&config_dir()?, address, identity_key)
 }
@@ -89,6 +94,11 @@ pub fn recognize(address: &str, identity_key: &[u8]) -> Result<Recognition> {
 /// trusted one. A pin for an *unchanged* key keeps its cached display name; a
 /// *changed* key adopts the new key and drops the stale name (it belonged to the
 /// old identity), to be repopulated when the peer next shares one.
+///
+/// # Errors
+///
+/// Fails if the contacts file can't be read, or the config directory can't be
+/// created or the file written.
 pub fn remember(address: &str, identity_key: &[u8]) -> Result<()> {
     remember_in(&config_dir()?, address, identity_key)
 }
@@ -97,12 +107,21 @@ pub fn remember(address: &str, identity_key: &[u8]) -> Result<()> {
 ///
 /// A no-op if the address isn't in the contact list — we only remember names for
 /// peers we've accepted — and it only rewrites the file when the name changes.
+///
+/// # Errors
+///
+/// Fails if the contacts file can't be read or (when the name changes) written.
 pub fn set_name(address: &str, name: Option<&str>) -> Result<()> {
     set_name_in(&config_dir()?, address, name)
 }
 
 /// The peers we've accepted before, for `/contacts`: named peers first
 /// (case-insensitive alphabetical), then unnamed ones by address.
+///
+/// # Errors
+///
+/// Fails if the config directory can't be located or the contacts file exists but
+/// can't be read.
 pub fn known_peers() -> Result<Vec<KnownPeer>> {
     known_peers_in(&config_dir()?)
 }

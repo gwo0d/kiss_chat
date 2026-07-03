@@ -32,6 +32,11 @@ const AUTH_SEED_FILE: &str = "auth.key";
 const DISPLAY_NAME_FILE: &str = "name";
 
 /// Load the persistent iroh endpoint key, creating one on first run.
+///
+/// # Errors
+///
+/// Fails if the config directory can't be located or created, or if an existing
+/// `secret.key` can't be read or is malformed.
 pub fn load_or_create_endpoint_secret() -> Result<SecretKey> {
     let bytes = load_or_create_key(&config_dir()?, ENDPOINT_KEY_FILE, || {
         SecretKey::generate().to_bytes()
@@ -40,6 +45,11 @@ pub fn load_or_create_endpoint_secret() -> Result<SecretKey> {
 }
 
 /// Load the persistent 32-byte ML-DSA authentication seed, creating one on first run.
+///
+/// # Errors
+///
+/// Fails if the config directory can't be located or created, or if an existing
+/// `auth.key` can't be read or is malformed.
 pub fn load_or_create_auth_seed() -> Result<[u8; 32]> {
     load_or_create_key(&config_dir()?, AUTH_SEED_FILE, random_seed)
 }
@@ -55,11 +65,21 @@ fn random_seed() -> [u8; 32] {
 ///
 /// Returns the raw stored string (trimmed); the caller sanitises it before use.
 /// A missing file is not an error — a display name is optional.
+///
+/// # Errors
+///
+/// Fails if the config directory can't be located, or the `name` file exists but
+/// can't be read.
 pub fn load_display_name() -> Result<Option<String>> {
     load_display_name_in(&config_dir()?)
 }
 
 /// Persist (or, with `None`, remove) the display name.
+///
+/// # Errors
+///
+/// Fails if the config directory can't be located or created, or the `name` file
+/// can't be written or removed.
 pub fn save_display_name(name: Option<&str>) -> Result<()> {
     save_display_name_in(&config_dir()?, name)
 }
@@ -175,10 +195,13 @@ fn encode_hex(bytes: &[u8; 32]) -> String {
 /// Decode a 64-character hex string (with optional surrounding whitespace) into 32 bytes.
 fn decode_hex(text: &str) -> Result<[u8; 32]> {
     let text = text.trim();
+    // `text.len()` counts bytes: a multibyte character could satisfy the length
+    // check yet make the 2-byte slices below straddle a char boundary and panic.
+    // Hex is ASCII, so reject anything else here and fail cleanly instead.
     ensure!(
-        text.len() == 64,
+        text.is_ascii() && text.len() == 64,
         "expected 64 hex characters, got {}",
-        text.len()
+        text.chars().count()
     );
     let mut bytes = [0u8; 32];
     for (i, byte) in bytes.iter_mut().enumerate() {
@@ -214,6 +237,16 @@ mod tests {
     #[test]
     fn decode_hex_rejects_non_hex() {
         assert!(decode_hex(&"z".repeat(64)).is_err());
+    }
+
+    #[test]
+    fn decode_hex_rejects_multibyte_without_panicking() {
+        // A 64-*byte* string can hold a multibyte character; the 2-byte slicing
+        // must reject it cleanly rather than panic on a non-char-boundary slice.
+        // 'é' is two UTF-8 bytes, so this is 64 bytes but only 63 characters.
+        let sneaky = format!("a\u{e9}{}", "0".repeat(61));
+        assert_eq!(sneaky.len(), 64);
+        assert!(decode_hex(&sneaky).is_err());
     }
 
     // A throwaway directory under the system temp dir, removed on drop.

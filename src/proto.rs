@@ -19,6 +19,10 @@ const MAX_FRAME: usize = 64 * 1024;
 /// we never put a frame on the wire that the peer would reject (and tear the session
 /// down over). Legitimate frames — handshake messages and length-capped chat lines —
 /// are comfortably under the limit, so this only ever fires on a bug.
+///
+/// # Errors
+///
+/// Fails if `data` exceeds `MAX_FRAME`, or the underlying stream write fails.
 pub async fn write_frame(send: &mut SendStream, data: &[u8]) -> Result<()> {
     ensure!(
         data.len() <= MAX_FRAME,
@@ -33,6 +37,11 @@ pub async fn write_frame(send: &mut SendStream, data: &[u8]) -> Result<()> {
 }
 
 /// Read one length-prefixed frame.
+///
+/// # Errors
+///
+/// Fails if the stream ends before a full frame arrives, or the peer's length
+/// prefix exceeds `MAX_FRAME`.
 pub async fn read_frame(recv: &mut RecvStream) -> Result<Vec<u8>> {
     let mut len_buf = [0u8; 4];
     recv.read_exact(&mut len_buf).await?;

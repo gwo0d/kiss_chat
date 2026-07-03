@@ -115,6 +115,7 @@ pub struct App {
 
 impl App {
     /// Create the app in the lobby, showing our own address so it can be shared.
+    #[must_use]
     pub fn new(my_address: String) -> Self {
         let mut app = Self {
             mode: Mode::Lobby,
@@ -389,8 +390,7 @@ impl App {
         self.input
             .char_indices()
             .nth(char_idx)
-            .map(|(i, _)| i)
-            .unwrap_or(self.input.len())
+            .map_or(self.input.len(), |(i, _)| i)
     }
 
     fn insert_char(&mut self, ch: char) {
@@ -644,27 +644,41 @@ impl App {
             Mode::Connecting => ("connecting…", Color::Yellow),
             Mode::Lobby => ("command (/connect <peer-id>, /help)", Color::Magenta),
         };
+        // The cursor's display column (wide glyphs such as CJK/emoji take two
+        // cells), and a horizontal scroll that keeps it in view once the line
+        // outgrows the box — so a long peer id no longer overflows the border.
+        let inner_width = input_area.width.saturating_sub(2) as usize;
+        let cursor_col = Span::raw(&self.input[..self.byte_index(self.cursor)]).width();
+        let scroll_x = horizontal_scroll(cursor_col, inner_width);
+
         let input_block = Block::bordered()
             .title(label)
             .border_style(Style::new().fg(color));
         frame.render_widget(
-            Paragraph::new(self.input.as_str()).block(input_block),
+            Paragraph::new(self.input.as_str())
+                .scroll((0, scroll_x as u16))
+                .block(input_block),
             input_area,
         );
 
-        // Place the cursor at its character position, clamped inside the box.
-        let max_x = input_area.x + input_area.width.saturating_sub(2);
-        let cursor_x = (input_area.x + 1 + self.cursor as u16).min(max_x);
+        // Place the cursor within the box, shifted left by the horizontal scroll.
+        let cursor_x = input_area.x + 1 + (cursor_col - scroll_x) as u16;
         frame.set_cursor_position((cursor_x, input_area.y + 1));
     }
+}
+
+/// Horizontal scroll offset that keeps the cursor — at display column `cursor_col`
+/// — visible inside an input box `inner_width` columns wide. Zero until the cursor
+/// reaches the right edge, then just enough to pin it to the last visible column.
+fn horizontal_scroll(cursor_col: usize, inner_width: usize) -> usize {
+    cursor_col.saturating_sub(inner_width.max(1) - 1)
 }
 
 /// Current UTC time as `HH:MM`.
 fn timestamp_now() -> String {
     let secs = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_secs())
-        .unwrap_or(0);
+        .map_or(0, |d| d.as_secs());
     let secs_of_day = secs % 86_400;
     format!("{:02}:{:02}", secs_of_day / 3600, (secs_of_day % 3600) / 60)
 }
@@ -1246,6 +1260,19 @@ mod tests {
         for word in phrase.split_whitespace() {
             assert!(blob.contains(word), "narrow render dropped: {word}");
         }
+    }
+
+    #[test]
+    fn horizontal_scroll_keeps_the_cursor_in_view() {
+        // Cursor within the box: nothing scrolls.
+        assert_eq!(horizontal_scroll(0, 10), 0);
+        assert_eq!(horizontal_scroll(9, 10), 0);
+        // Cursor at or past the right edge: scroll to pin it to the last column.
+        assert_eq!(horizontal_scroll(10, 10), 1);
+        assert_eq!(horizontal_scroll(25, 10), 16);
+        // Degenerate widths must never panic.
+        assert_eq!(horizontal_scroll(5, 0), 5);
+        assert_eq!(horizontal_scroll(0, 0), 0);
     }
 
     #[test]
