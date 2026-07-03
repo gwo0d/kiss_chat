@@ -3,6 +3,9 @@ name = "kiss_chat"
 description = "A keep-it-simple peer-to-peer chat with quantum-resistant end-to-end encryption."
 version = "0.4.0"
 edition = "2024"
+# Real build floor, driven by dependencies (iroh), not the 2024 edition's 1.85.
+# Re-check on dependency bumps and keep the README in step.
+rust-version = "1.91"
 authors = ["George O. Wood <git@gwood.dev>"]
 license = "GPL-3.0-or-later"
 repository = "https://github.com/gwo0d/kiss_chat"

@@ -15,6 +15,7 @@
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 
 use crate::contacts::PinStatus;
+use crate::message;
 use ratatui::{
     Frame,
     layout::{Constraint, Layout},
@@ -184,7 +185,7 @@ impl App {
     ///     the safety words adds nothing; we ask only for a light consent to reconnect,
     ///     while still leaving the words a `/safety` away for the cautious.
     ///
-    /// Either way the channel is held in [`Mode::Verifying`] until the user `/accept`s,
+    /// Either way the channel is held in the verify gate until the user `/accept`s,
     /// so a peer can never force us into a chat without our say-so. `known_name` is the
     /// name cached for a recognised peer, shown so they're identifiable at a glance.
     pub fn set_verifying(
@@ -451,6 +452,16 @@ impl App {
         }
         match self.mode {
             Mode::Connected => {
+                // Cap the length before echoing or sending: an over-long line would
+                // otherwise be a frame the peer rejects, tearing down their session.
+                let len = line.chars().count();
+                if len > message::MAX_MESSAGE_CHARS {
+                    self.push_system(format!(
+                        "message too long ({len} characters, max {}) — not sent",
+                        message::MAX_MESSAGE_CHARS
+                    ));
+                    return Action::None;
+                }
                 self.push(Author::You, line.clone());
                 Action::Send(line)
             }
@@ -871,6 +882,33 @@ mod tests {
             Action::Send(line) => assert_eq!(line, "hi there"),
             _ => panic!("expected Send after /accept"),
         }
+    }
+
+    #[test]
+    fn an_over_long_message_is_refused_not_sent() {
+        // A line past the cap must not be echoed or sent — otherwise it becomes a
+        // frame the peer rejects, tearing their session down.
+        let mut app = App::new("my-addr".into());
+        reach_connected(&mut app);
+        let long = "a".repeat(message::MAX_MESSAGE_CHARS + 1);
+        assert!(matches!(submit_line(&mut app, &long), Action::None));
+        assert!(
+            app.history.iter().any(|l| l.text.contains("too long")),
+            "the user should be told the message was too long"
+        );
+        // A "you:" echo must not have been recorded for the refused line.
+        assert!(
+            !app.history.iter().any(|l| matches!(l.author, Author::You)),
+            "a refused message must not be echoed locally"
+        );
+    }
+
+    #[test]
+    fn a_message_at_the_cap_is_sent() {
+        let mut app = App::new("my-addr".into());
+        reach_connected(&mut app);
+        let at_cap = "a".repeat(message::MAX_MESSAGE_CHARS);
+        assert!(matches!(submit_line(&mut app, &at_cap), Action::Send(_)));
     }
 
     #[test]

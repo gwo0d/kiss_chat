@@ -20,6 +20,12 @@
 /// Longest display name we keep, in characters. Anything longer is truncated.
 pub const MAX_NAME_CHARS: usize = 32;
 
+/// Longest chat message we send, in characters. The UI refuses longer input with a
+/// notice rather than sending it, keeping every sealed frame well within [`crate::proto`]'s
+/// 64 KiB cap even after UTF-8 encoding and the AEAD tag — so an oversized paste can
+/// never make the *peer's* reader reject the frame and tear the session down.
+pub const MAX_MESSAGE_CHARS: usize = 4096;
+
 /// A message the local user sends to the peer.
 pub enum Outgoing {
     /// A chat message.

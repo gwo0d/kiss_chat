@@ -14,8 +14,19 @@ use iroh::endpoint::{RecvStream, SendStream};
 const MAX_FRAME: usize = 64 * 1024;
 
 /// Write one length-prefixed frame.
+///
+/// Enforces the same `MAX_FRAME` cap the reader does, so the invariant is symmetric:
+/// we never put a frame on the wire that the peer would reject (and tear the session
+/// down over). Legitimate frames — handshake messages and length-capped chat lines —
+/// are comfortably under the limit, so this only ever fires on a bug.
 pub async fn write_frame(send: &mut SendStream, data: &[u8]) -> Result<()> {
-    let len = u32::try_from(data.len()).map_err(|_| anyhow::anyhow!("frame too large to send"))?;
+    ensure!(
+        data.len() <= MAX_FRAME,
+        "refusing to send oversized frame: {} bytes (max {MAX_FRAME})",
+        data.len()
+    );
+    // Lossless: data.len() <= MAX_FRAME, which is far below u32::MAX.
+    let len = data.len() as u32;
     send.write_all(&len.to_be_bytes()).await?;
     send.write_all(data).await?;
     Ok(())

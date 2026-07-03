@@ -67,6 +67,21 @@ jobs:
         # Runs unit, integration (real iroh loopback endpoints), and doc tests.
         run: cargo test --locked
 
+  docs:
+    name: rustdoc
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install Rust (stable)
+        uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Check documentation
+        # Broken intra-doc links and other rustdoc lints fail the build, just as
+        # RUSTFLAGS="-D warnings" makes compiler warnings fail the jobs above.
+        env:
+          RUSTDOCFLAGS: "-D warnings"
+        run: cargo doc --no-deps --locked
+
   audit:
     name: cargo-audit
     runs-on: ubuntu-latest
