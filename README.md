@@ -7,6 +7,7 @@
 </picture>
 
 [![CI](https://img.shields.io/github/actions/workflow/status/gwo0d/kiss_chat/ci.yml?branch=main&label=CI&logo=github)](https://github.com/gwo0d/kiss_chat/actions/workflows/ci.yml)
+[![docs.rs](https://img.shields.io/docsrs/kiss_chat?logo=rust&label=docs.rs)](https://docs.rs/kiss_chat/latest/kiss_chat/)
 [![crates.io](https://img.shields.io/crates/v/kiss_chat.svg?logo=rust)](https://crates.io/crates/kiss_chat)
 [![Downloads](https://img.shields.io/crates/d/kiss_chat.svg)](https://crates.io/crates/kiss_chat)
 [![License: GPL-3.0-or-later](https://img.shields.io/crates/l/kiss_chat.svg)](https://github.com/gwo0d/kiss_chat/blob/main/LICENSE.md)
