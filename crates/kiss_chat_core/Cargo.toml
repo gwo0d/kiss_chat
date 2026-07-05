@@ -1,0 +1,28 @@
+[package]
+name = "kiss_chat_core"
+description = "Protocol core of kiss_chat: iroh transport, hybrid post-quantum handshake, session encryption, identity, and contacts."
+readme = "README.md"
+keywords = ["chat", "p2p", "post-quantum", "encryption"]
+categories = ["cryptography", "network-programming"]
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+anyhow.workspace = true
+chacha20poly1305.workspace = true
+getrandom.workspace = true
+hkdf.workspace = true
+iroh.workspace = true
+ml-dsa.workspace = true
+ml-kem.workspace = true
+sha2.workspace = true
+x25519-dalek.workspace = true
+zeroize.workspace = true
+
+[dev-dependencies]
+# The loopback integration tests in `transport` drive real async endpoints.
+tokio = { workspace = true, features = ["rt-multi-thread", "macros", "time"] }

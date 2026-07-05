@@ -1,26 +1,27 @@
-[package]
-name = "kiss_chat"
-description = "A keep-it-simple peer-to-peer chat with quantum-resistant end-to-end encryption."
+[workspace]
+resolver = "3"
+members = ["crates/kiss_chat_core", "crates/kiss_chat"]
+# Plain `cargo build`/`cargo test` covers the published crates. Future frontend
+# crates (desktop/mobile apps) join `members` but not `default-members`, so they
+# build only when asked for explicitly with `-p`.
+default-members = ["crates/kiss_chat_core", "crates/kiss_chat"]
+
+[workspace.package]
 version = "0.4.1"
 edition = "2024"
 # Real build floor, driven by dependencies (iroh), not the 2024 edition's 1.85.
-# Re-check on dependency bumps and keep the README in step.
+# Re-check on dependency bumps and keep the README and the CI msrv job in step.
 rust-version = "1.91"
 authors = ["George O. Wood <git@gwood.dev>"]
 license = "GPL-3.0-or-later"
 repository = "https://github.com/gwo0d/kiss_chat"
-keywords = ["chat", "p2p", "post-quantum", "encryption", "tui"]
-categories = ["command-line-utilities", "cryptography"]
-exclude = ["assets/", ".github/"]
 
-[profile.release]
-opt-level = 3
-lto = true
-codegen-units = 1
-panic = "abort"
-strip = true
+[workspace.dependencies]
+# Keep `version` in step with [workspace.package] version on release bumps:
+# it is what the published kiss_chat crate requires of kiss_chat_core on
+# crates.io, where the `path` is meaningless.
+kiss_chat_core = { path = "crates/kiss_chat_core", version = "0.4.1" }
 
-[dependencies]
 anyhow = "1.0.103"
 chacha20poly1305 = { version = "0.11.0", features = ["zeroize"] }
 crossterm = { version = "0.29.0", features = ["event-stream"] }
@@ -31,6 +32,13 @@ ml-dsa = { version = "0.1.1", features = ["zeroize"] }
 ml-kem = { version = "0.3.2", features = ["getrandom", "zeroize"] }
 ratatui = "0.30.2"
 sha2 = { version = "0.11.0", features = ["zeroize"] }
-tokio = { version = "1.52.3", features = ["rt-multi-thread", "macros", "sync", "io-util", "net", "rt"] }
+tokio = "1.52.3"
 x25519-dalek = { version = "2.0.1", features = ["static_secrets", "zeroize"] }
 zeroize = "1.9.0"
+
+[profile.release]
+opt-level = 3
+lto = true
+codegen-units = 1
+panic = "abort"
+strip = true
