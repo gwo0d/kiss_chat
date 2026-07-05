@@ -27,6 +27,9 @@ use ratatui::{
 /// How many wrapped lines PageUp/PageDown move the history view.
 const SCROLL_STEP: usize = 5;
 
+/// The crate version, shown in the frame title and reported by `/version`.
+const VERSION: &str = env!("CARGO_PKG_VERSION");
+
 /// An event flowing from the network tasks into the UI.
 pub enum NetEvent {
     /// A decrypted message from the peer.
@@ -558,6 +561,10 @@ impl App {
                 self.scroll_lines = 0;
                 Action::None
             }
+            "version" | "v" => {
+                self.push_system(format!("kiss_chat {VERSION}"));
+                Action::None
+            }
             "quit" | "q" => {
                 self.should_quit = true;
                 Action::Quit
@@ -578,6 +585,7 @@ impl App {
                 self.push_system("  /contacts            list the peers you've accepted before");
                 self.push_system("  /address             show your own address to share");
                 self.push_system("  /clear               clear the screen");
+                self.push_system("  /version             show the version (alias /v)");
                 self.push_system("  /help                show this help");
                 self.push_system("  /quit                exit (or Esc / Ctrl-C)");
                 self.push_system("  //text               send a message that begins with a slash");
@@ -623,11 +631,11 @@ impl App {
 
         let title = if self.scroll_lines > 0 {
             format!(
-                " kiss_chat — {} · [↑{} more] ",
+                " kiss_chat ({VERSION}) — {} · [↑{} more] ",
                 self.status, self.scroll_lines
             )
         } else {
-            format!(" kiss_chat — {} ", self.status)
+            format!(" kiss_chat ({VERSION}) — {} ", self.status)
         };
         frame.render_widget(
             List::new(items).block(Block::bordered().title(title)),
@@ -1176,6 +1184,26 @@ mod tests {
         assert!(!app.history.is_empty());
         assert!(matches!(submit_line(&mut app, "/clear"), Action::None));
         assert!(app.history.is_empty());
+    }
+
+    #[test]
+    fn version_command_reports_the_crate_version() {
+        let mut app = App::new("my-addr".into());
+        assert!(matches!(submit_line(&mut app, "/version"), Action::None));
+        assert!(
+            app.history
+                .iter()
+                .any(|line| line.text.contains(env!("CARGO_PKG_VERSION"))),
+            "/version should report the crate version"
+        );
+        // The /v alias behaves identically.
+        let mut app = App::new("my-addr".into());
+        let _ = submit_line(&mut app, "/v");
+        assert!(
+            app.history
+                .iter()
+                .any(|line| line.text.contains(env!("CARGO_PKG_VERSION")))
+        );
     }
 
     #[test]

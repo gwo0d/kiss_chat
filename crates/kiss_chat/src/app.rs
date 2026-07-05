@@ -86,13 +86,20 @@ enum Input {
 /// Print command-line usage to stdout.
 pub fn print_usage() {
     println!(
-        "kiss_chat — P2P quantum-resistant chat\n\n\
+        "kiss_chat {} — P2P quantum-resistant chat\n\n\
          usage:\n\
          \x20 kiss_chat              listen in the lobby; share your address and wait\n\
-         \x20 kiss_chat <peer-id>    dial a peer immediately\n\n\
+         \x20 kiss_chat <peer-id>    dial a peer immediately\n\
+         \x20 kiss_chat --version    print the version and exit (also -v)\n\n\
          inside the app: /connect <peer-id>, /accept, /reject, /name, /safety,\n\
-         \x20               /contacts, /address, /clear, /help, /quit"
+         \x20               /contacts, /address, /clear, /version, /help, /quit",
+        env!("CARGO_PKG_VERSION")
     );
+}
+
+/// Print the version to stdout (for `--version` / `-v`).
+pub fn print_version() {
+    println!("kiss_chat {}", env!("CARGO_PKG_VERSION"));
 }
 
 /// List the peers we've accepted before (name, if cached, and full address so it can

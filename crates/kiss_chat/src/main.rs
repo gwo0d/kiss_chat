@@ -9,6 +9,7 @@
 //! ```text
 //! kiss_chat              come up in the lobby: share your address, then wait or /connect
 //! kiss_chat <ADDRESS>    come up and immediately dial that peer (an iroh EndpointId)
+//! kiss_chat --version    print the version and exit (also -v)
 //! ```
 //!
 //! # In-app commands
@@ -24,6 +25,7 @@
 //! | `/address` | show your own address to share |
 //! | `/name [text]` | set your (optional) display name; only shared after `/accept` |
 //! | `/clear` | clear the screen |
+//! | `/version` | show the version (also `/v`) |
 //! | `/help` | list commands |
 //! | `/quit` | exit (also `Esc` / `Ctrl-C`) |
 
@@ -35,9 +37,16 @@ use anyhow::Result;
 #[tokio::main]
 async fn main() -> Result<()> {
     let peer_arg = std::env::args().nth(1);
-    if matches!(peer_arg.as_deref(), Some("-h" | "--help")) {
-        app::print_usage();
-        return Ok(());
+    match peer_arg.as_deref() {
+        Some("-h" | "--help") => {
+            app::print_usage();
+            return Ok(());
+        }
+        Some("-v" | "--version") => {
+            app::print_version();
+            return Ok(());
+        }
+        _ => {}
     }
     app::run(peer_arg).await
 }

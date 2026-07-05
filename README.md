@@ -105,6 +105,9 @@ cargo run
 cargo run -- 96aedec725a0104933cfd73a2722b3497b13307100a242ccb47efe9cb1fafa39
 ```
 
+Pass `--version` (or `-v`) to print the version and exit; `--help` (or `-h`) prints usage. Inside
+the app, `/version` (alias `/v`) shows the same version, which also appears in the frame title.
+
 Your keys live in `$XDG_CONFIG_HOME/kiss_chat/` (falling back to `~/.config/kiss_chat/`),
 owner-readable only: `secret.key` is your iroh address and `auth.key` is your ML-DSA
 authentication seed. Delete them to rotate to a fresh identity; copy them to run as the same
@@ -167,6 +170,7 @@ The input line doubles as a command prompt:
 | `/contacts` | list the peers you've accepted before (alias `/peers`) |
 | `/address` | show your own address to share (alias `/addr`) |
 | `/clear` | clear the screen |
+| `/version` | show the version (alias `/v`) |
 | `/help` | list commands (alias `/h`, `/?`) |
 | `/quit` | exit (alias `/q`; also <kbd>Esc</kbd> or <kbd>Ctrl-C</kbd>) |
 
