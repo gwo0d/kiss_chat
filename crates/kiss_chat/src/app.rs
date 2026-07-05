@@ -15,11 +15,12 @@ use ratatui::DefaultTerminal;
 use tokio::sync::mpsc::{self, Sender, UnboundedReceiver, UnboundedSender};
 use tokio::task::JoinHandle;
 
-use crate::contacts::PinStatus;
-use crate::crypto::{Opener, Sealer, Session};
-use crate::message::Outgoing;
+use kiss_chat_core::contacts::PinStatus;
+use kiss_chat_core::crypto::{Opener, Sealer, Session};
+use kiss_chat_core::message::Outgoing;
+use kiss_chat_core::{contacts, crypto, identity, message, proto, transport};
+
 use crate::ui::{Action, App, NetEvent};
-use crate::{contacts, crypto, identity, message, proto, transport};
 
 /// How long to wait for a peer to acknowledge our goodbye before closing anyway.
 const FAREWELL_TIMEOUT: Duration = Duration::from_secs(1);

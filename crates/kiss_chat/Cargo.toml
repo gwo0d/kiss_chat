@@ -1,0 +1,21 @@
+[package]
+name = "kiss_chat"
+description = "A keep-it-simple peer-to-peer chat with quantum-resistant end-to-end encryption."
+readme = "../../README.md"
+keywords = ["chat", "p2p", "post-quantum", "encryption", "tui"]
+categories = ["command-line-utilities", "cryptography"]
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+kiss_chat_core.workspace = true
+
+anyhow.workspace = true
+crossterm.workspace = true
+iroh.workspace = true
+ratatui.workspace = true
+tokio = { workspace = true, features = ["rt-multi-thread", "macros", "sync", "time"] }

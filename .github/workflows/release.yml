@@ -68,7 +68,7 @@ jobs:
           key: ${{ matrix.target }}
 
       - name: Build
-        run: cargo build --release --locked --target ${{ matrix.target }}
+        run: cargo build --release --locked --target ${{ matrix.target }} -p kiss_chat
 
       - name: Package (Unix)
         if: runner.os != 'Windows'

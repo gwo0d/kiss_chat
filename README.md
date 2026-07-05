@@ -202,6 +202,13 @@ side dropping returns you to the lobby, where you can `/connect` to someone new.
 └──────────────┘   decrypted messages  └────────────────────────────┘
 ```
 
+The repository is a Cargo workspace of two published crates:
+[`kiss_chat_core`](crates/kiss_chat_core) — the protocol, everything that isn't a user
+interface — and [`kiss_chat`](crates/kiss_chat), the terminal frontend that consumes it
+(and the binary you install).
+
+**`kiss_chat_core`:**
+
 | Module | Responsibility |
 |--------|----------------|
 | `identity` | persistent on-disk keys (iroh address + ML-DSA auth seed) |
@@ -210,8 +217,13 @@ side dropping returns you to the lobby, where you can `/connect` to someone new.
 | `proto` | length-prefixed framing over the stream |
 | `message` | 1-byte-tagged in-band protocol (chat text vs. a `Bye` control frame) |
 | `crypto` | hybrid KEX, ML-DSA authentication, key derivation, ChaCha20-Poly1305 session |
+
+**`kiss_chat`:**
+
+| Module | Responsibility |
+|--------|----------------|
 | `ui` | terminal interface (pure state machine) |
-| `main` | the event loop wiring input, connection tasks, and the UI together |
+| `app` | the event loop wiring input, connection tasks, and the UI together |
 
 ### The handshake, briefly
 
@@ -263,7 +275,7 @@ identities) means the phrase can't be mined offline, so a MITM can't precompute 
 
 ```bash
 cargo test          # crypto/identity/ui unit tests + full-stack loopback integration tests
-cargo clippy --all-targets
+cargo clippy --workspace --all-targets
 ```
 
 The integration tests spin up two real iroh endpoints on loopback and run a complete

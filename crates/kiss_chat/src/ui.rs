@@ -14,8 +14,8 @@
 
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 
-use crate::contacts::PinStatus;
-use crate::message;
+use kiss_chat_core::contacts::PinStatus;
+use kiss_chat_core::message;
 use ratatui::{
     Frame,
     layout::{Constraint, Layout},

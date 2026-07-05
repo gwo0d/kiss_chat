@@ -45,7 +45,7 @@ jobs:
         with:
           components: clippy
       - uses: Swatinem/rust-cache@v2
-      - run: cargo clippy --all-targets --locked
+      - run: cargo clippy --workspace --all-targets --locked
 
   test:
     name: test (${{ matrix.os }})
@@ -62,10 +62,10 @@ jobs:
         with:
           key: ${{ matrix.os }}
       - name: Build
-        run: cargo build --all-targets --locked
+        run: cargo build --workspace --all-targets --locked
       - name: Test
         # Runs unit, integration (real iroh loopback endpoints), and doc tests.
-        run: cargo test --locked
+        run: cargo test --workspace --locked
 
   msrv:
     name: msrv (1.91)
@@ -73,12 +73,13 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - name: Install Rust (pinned MSRV)
-        # Must match `rust-version` in Cargo.toml. A dependency bump that raises the
-        # real floor fails here, prompting us to bump both together (and the README).
+        # Must match `rust-version` in the workspace-root Cargo.toml. A dependency
+        # bump that raises the real floor fails here, prompting us to bump both
+        # together (and the README).
         uses: dtolnay/rust-toolchain@1.91.0
       - uses: Swatinem/rust-cache@v2
       - name: Check against the MSRV
-        run: cargo check --all-targets --locked
+        run: cargo check --workspace --all-targets --locked
 
   docs:
     name: rustdoc
@@ -93,7 +94,7 @@ jobs:
         # RUSTFLAGS="-D warnings" makes compiler warnings fail the jobs above.
         env:
           RUSTDOCFLAGS: "-D warnings"
-        run: cargo doc --no-deps --locked
+        run: cargo doc --workspace --no-deps --locked
 
   audit:
     name: cargo-audit
