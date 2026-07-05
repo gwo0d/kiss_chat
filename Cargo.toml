@@ -7,7 +7,7 @@ members = ["crates/kiss_chat_core", "crates/kiss_chat"]
 default-members = ["crates/kiss_chat_core", "crates/kiss_chat"]
 
 [workspace.package]
-version = "0.4.1"
+version = "0.5.0"
 edition = "2024"
 # Real build floor, driven by dependencies (iroh), not the 2024 edition's 1.85.
 # Re-check on dependency bumps and keep the README and the CI msrv job in step.
@@ -20,7 +20,7 @@ repository = "https://github.com/gwo0d/kiss_chat"
 # Keep `version` in step with [workspace.package] version on release bumps:
 # it is what the published kiss_chat crate requires of kiss_chat_core on
 # crates.io, where the `path` is meaningless.
-kiss_chat_core = { path = "crates/kiss_chat_core", version = "0.4.1" }
+kiss_chat_core = { path = "crates/kiss_chat_core", version = "0.5.0" }
 
 anyhow = "1.0.103"
 chacha20poly1305 = { version = "0.11.0", features = ["zeroize"] }
