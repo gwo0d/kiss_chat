@@ -36,3 +36,6 @@ pub mod identity;
 pub mod message;
 pub mod proto;
 pub mod transport;
+
+#[cfg(test)]
+mod test_support;

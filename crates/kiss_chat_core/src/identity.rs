@@ -214,6 +214,7 @@ fn decode_hex(text: &str) -> Result<[u8; 32]> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::test_support::TempDir;
 
     #[test]
     fn hex_round_trips() {
@@ -247,28 +248,6 @@ mod tests {
         let sneaky = format!("a\u{e9}{}", "0".repeat(61));
         assert_eq!(sneaky.len(), 64);
         assert!(decode_hex(&sneaky).is_err());
-    }
-
-    // A throwaway directory under the system temp dir, removed on drop.
-    struct TempDir(PathBuf);
-
-    impl TempDir {
-        fn new() -> Self {
-            let nanos = std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap()
-                .as_nanos();
-            let dir =
-                std::env::temp_dir().join(format!("kiss_chat_test_{}_{nanos}", std::process::id()));
-            std::fs::create_dir_all(&dir).unwrap();
-            Self(dir)
-        }
-    }
-
-    impl Drop for TempDir {
-        fn drop(&mut self) {
-            let _ = std::fs::remove_dir_all(&self.0);
-        }
     }
 
     #[test]

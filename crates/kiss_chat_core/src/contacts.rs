@@ -283,6 +283,7 @@ fn contacts_path(dir: &Path) -> PathBuf {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::test_support::TempDir;
 
     fn named(fingerprint: &str, name: &str) -> Contact {
         Contact {
@@ -335,28 +336,6 @@ mod tests {
         assert_eq!(map.get("addr2"), Some(&anon("fp2")));
         assert_eq!(map.get("addr3"), Some(&named("fp3", "Bob and the spaces")));
         assert_eq!(map.len(), 3);
-    }
-
-    // A throwaway directory under the system temp dir, removed on drop.
-    struct TempDir(PathBuf);
-
-    impl TempDir {
-        fn new() -> Self {
-            let nanos = std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap()
-                .as_nanos();
-            let dir = std::env::temp_dir()
-                .join(format!("kiss_chat_contacts_{}_{nanos}", std::process::id()));
-            std::fs::create_dir_all(&dir).unwrap();
-            Self(dir)
-        }
-    }
-
-    impl Drop for TempDir {
-        fn drop(&mut self) {
-            let _ = std::fs::remove_dir_all(&self.0);
-        }
     }
 
     #[test]
