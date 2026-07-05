@@ -1,5 +1,9 @@
 # kiss_chat_core
 
+[![docs.rs](https://img.shields.io/docsrs/kiss_chat_core?logo=rust&label=docs.rs)](https://docs.rs/kiss_chat_core/latest/kiss_chat_core/)
+[![crates.io](https://img.shields.io/crates/v/kiss_chat_core.svg?logo=rust)](https://crates.io/crates/kiss_chat_core)
+[![License: GPL-3.0-or-later](https://img.shields.io/crates/l/kiss_chat_core.svg)](https://github.com/gwo0d/kiss_chat/blob/main/LICENSE.md)
+
 The protocol core of [kiss_chat](https://github.com/gwo0d/kiss_chat) — a
 keep-it-simple, peer-to-peer chat with quantum-resistant end-to-end encryption.
 Two people, one direct encrypted conversation, no servers to trust.
