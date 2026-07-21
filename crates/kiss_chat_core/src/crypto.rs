@@ -672,6 +672,31 @@ mod tests {
     }
 
     #[test]
+    fn a_failed_open_does_not_advance_the_counter() {
+        // Replicates: seal a frame, corrupt a copy, fail to open the corrupt copy,
+        // then open the genuine frame. A rejected frame must not consume a nonce, so
+        // the untouched original must still decrypt.
+        let (a, b) = handshake();
+        let (mut a_seal, _) = a.split();
+        let (_, mut b_open) = b.split();
+
+        let genuine = a_seal.seal(b"the real message").unwrap();
+        let mut corrupt = genuine.clone();
+        let last = corrupt.len() - 1;
+        corrupt[last] ^= 0x01;
+
+        assert!(
+            b_open.open(&corrupt).is_err(),
+            "corrupt frame must be rejected"
+        );
+        assert_eq!(
+            b_open.open(&genuine).unwrap(),
+            b"the real message",
+            "a rejected frame must not advance the nonce counter"
+        );
+    }
+
+    #[test]
     fn tampered_responder_signature_is_rejected() {
         let initiator = initiator_start(identity(1));
         let (_pending, mut msg2) =
