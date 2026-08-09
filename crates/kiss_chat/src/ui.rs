@@ -80,11 +80,41 @@ enum Author {
     /// being buried in the dim system chatter. `text` holds the raw space-separated
     /// phrase; the grid layout is computed at render time to fit the terminal width.
     Safety,
+    /// One form of our own address, laid out to be copied: no timestamp/label
+    /// prefix (which would both waste width and ride along on a drag-select), a
+    /// small indent, and wrapping only at the spaces already in the text.
+    Address,
+    /// The 24-word form of our own address, rendered as a numbered grid like the
+    /// safety words — but in the address accent, under an unmistakable header,
+    /// because the two must never be confused: an address is public, safety words
+    /// are a verification ritual.
+    AddressWords,
+    /// A QR code of our own address, rendered in half-block characters. Never
+    /// wrapped — a wrapped QR code is garbage — so if the terminal is too narrow
+    /// a note takes its place until the user widens it and scrolls or re-runs /qr.
+    Qr,
 }
 
 /// Accent colour for the safety words — high-contrast and distinct from the You /
 /// Peer / System / Warning palette so the block reads as its own thing.
 const SAFETY_ACCENT: Color = Color::LightYellow;
+
+/// Accent colour for our own address blocks. Cyan is the colour of "you" in the
+/// chat labels, which is exactly what an address is — and visibly not the safety
+/// words' yellow, so the two word blocks can never be mistaken for one another.
+const ADDRESS_ACCENT: Color = Color::Cyan;
+
+/// The user's own address in each display form, precomputed by the frontend —
+/// this module renders and recalls them but never encodes or parses.
+pub struct OwnAddress {
+    /// Canonical hex [`iroh::EndpointId`] — the form every kiss_chat version,
+    /// however old, can dial.
+    pub hex: String,
+    /// The `kiss1…` bech32m form: checksummed, and the best one to copy or share.
+    pub bech32: String,
+    /// The 24-word form, for reading aloud or writing down.
+    pub words: String,
+}
 
 struct ChatLine {
     author: Author,
@@ -117,15 +147,16 @@ pub struct App {
     /// Lines typed while waiting for the peer to accept, held so they can be sent
     /// the moment chat opens instead of being silently dropped.
     pending_lines: Vec<String>,
-    /// Our own address, kept so `/address` can recall it after `/clear`.
-    my_address: String,
+    /// Our own address (in every display form), kept so `/address`, `/qr` and
+    /// friends can recall it after `/clear`.
+    my_address: OwnAddress,
     pub should_quit: bool,
 }
 
 impl App {
     /// Create the app in the lobby, showing our own address so it can be shared.
     #[must_use]
-    pub fn new(my_address: String) -> Self {
+    pub fn new(my_address: OwnAddress) -> Self {
         let mut app = Self {
             mode: Mode::Lobby,
             status: "lobby".into(),
@@ -139,14 +170,16 @@ impl App {
             peer_name: None,
             peer_accepted: false,
             pending_lines: Vec::new(),
-            my_address: my_address.clone(),
+            my_address,
             should_quit: false,
         };
         app.push_system("welcome to kiss_chat");
-        app.push_system(format!("your address: {my_address}"));
+        app.push_system("your address:");
+        let bech32 = grouped_bech32(&app.my_address.bech32);
+        app.push(Author::Address, bech32);
         app.push_system("share it so a peer can dial you, or connect out with:");
-        app.push_system("  /connect <peer-id>");
-        app.push_system("type /help for all commands");
+        app.push_system("  /connect <address>");
+        app.push_system("type /help for all commands (/address shows more ways to share yours)");
         app
     }
 
@@ -173,6 +206,16 @@ impl App {
     /// Push the safety words as their own highlighted, numbered block.
     fn push_safety(&mut self, phrase: impl Into<String>) {
         self.push(Author::Safety, phrase.into());
+    }
+
+    /// Push the 24-word form of our own address, bracketed by guidance that keeps
+    /// it from ever being mistaken for the safety words.
+    fn push_address_words(&mut self) {
+        self.push_system("your address as 24 words — the easiest form to read aloud:");
+        let words = self.my_address.words.clone();
+        self.push(Author::AddressWords, words);
+        self.push_system("these words are your public address: share them freely.");
+        self.push_system("they are NOT safety words — never use them to verify a peer.");
     }
 
     /// Enter the "dialing a peer" state.
@@ -445,6 +488,23 @@ impl App {
         }
     }
 
+    /// Insert pasted text at the cursor, as typing would — except that a paste
+    /// must never *submit*. Terminals wrap long strings (addresses, notably), so
+    /// a paste can arrive with newlines in it; fed through the key path those
+    /// become Enter presses, firing off half a message and leaving the rest in
+    /// the input line. Here every newline or tab becomes a single space instead,
+    /// and other control characters are dropped.
+    pub fn on_paste(&mut self, text: &str) {
+        // Fold CRLF first so it becomes one space, not two.
+        for ch in text.replace("\r\n", "\n").chars() {
+            match ch {
+                '\n' | '\r' | '\t' => self.insert_char(' '),
+                ch if ch.is_control() => {}
+                ch => self.insert_char(ch),
+            }
+        }
+    }
+
     // --- input editing -----------------------------------------------------
 
     fn input_len(&self) -> usize {
@@ -553,7 +613,7 @@ impl App {
                 Action::None
             }
             _ => {
-                self.push_system("not connected — use /connect <peer-id>");
+                self.push_system("not connected — use /connect <address>");
                 Action::None
             }
         }
@@ -566,21 +626,25 @@ impl App {
         match name {
             // Allowed from the lobby or while connected (which switches peers);
             // refused mid-dial and mid-verify, when there's nothing sensible to do.
-            "connect" | "c" => match arg {
-                Some(id) if matches!(self.mode, Mode::Lobby | Mode::Connected) => {
-                    Action::Connect(id.to_string())
-                }
-                // Mid-verify or waiting on the peer: there's a pending decision or a
-                // half-open channel, so finish (or /reject) it before dialling out.
-                Some(_) => {
+            // The whole rest of the line is the address: the word form is 24
+            // whitespace-separated words, so taking a single token would cut it off.
+            "connect" | "c" => {
+                let rest = command
+                    .split_once(char::is_whitespace)
+                    .map(|(_, rest)| rest.trim().to_string())
+                    .unwrap_or_default();
+                if rest.is_empty() {
+                    self.push_system("usage: /connect <address>");
+                    Action::None
+                } else if matches!(self.mode, Mode::Lobby | Mode::Connected) {
+                    Action::Connect(rest)
+                } else {
+                    // Mid-verify or waiting on the peer: there's a pending decision or
+                    // a half-open channel, so finish (or /reject) it before dialling out.
                     self.push_system("finish the current connection first");
                     Action::None
                 }
-                None => {
-                    self.push_system("usage: /connect <peer-id>");
-                    Action::None
-                }
-            },
+            }
             "accept" | "a" => {
                 if self.mode == Mode::Verifying {
                     self.mark_accepted();
@@ -613,8 +677,31 @@ impl App {
                 }
             }
             "address" | "addr" => {
-                let address = self.my_address.clone();
-                self.push_system(format!("your address: {address}"));
+                if arg == Some("words") {
+                    self.push_address_words();
+                } else {
+                    self.push_system("your address — the kiss1… form is the one to share:");
+                    let bech32 = grouped_bech32(&self.my_address.bech32);
+                    self.push(Author::Address, bech32);
+                    self.push_system("as plain hex, for peers on older kiss_chat versions:");
+                    let hex = self.my_address.hex.clone();
+                    self.push(Author::Address, hex);
+                    self.push_system(
+                        "also shareable as words (/address words) or as a QR code (/qr)",
+                    );
+                }
+                Action::None
+            }
+            "qr" => {
+                match qr_half_blocks(&self.my_address.bech32) {
+                    Ok(qr) => {
+                        self.push_system(
+                            "your address as a QR code — scan it with another device:",
+                        );
+                        self.push(Author::Qr, qr);
+                    }
+                    Err(err) => self.push_system(format!("could not build the QR code: {err}")),
+                }
                 Action::None
             }
             // The contact list lives on disk, so the main loop reads it and reports
@@ -645,7 +732,7 @@ impl App {
             "help" | "h" | "?" => {
                 self.push_system("commands:");
                 self.push_system(
-                    "  /connect <peer-id>   dial a peer (switches if already connected)",
+                    "  /connect <address>   dial a peer (switches if already connected)",
                 );
                 self.push_system(
                     "  /accept              accept the peer (compare the safety words first, if prompted)",
@@ -656,7 +743,8 @@ impl App {
                 );
                 self.push_system("  /safety              re-show the current safety words");
                 self.push_system("  /contacts            list the peers you've accepted before");
-                self.push_system("  /address             show your own address to share");
+                self.push_system("  /address [words]     show your own address to share");
+                self.push_system("  /qr                  show your own address as a QR code");
                 self.push_system("  /clear               clear the screen");
                 self.push_system("  /version             show the version (alias /v)");
                 self.push_system("  /help                show this help");
@@ -724,7 +812,7 @@ impl App {
             }
             Mode::Verifying => ("verify: /accept or /reject", Color::Yellow),
             Mode::Connecting => ("connecting…", Color::Yellow),
-            Mode::Lobby => ("command (/connect <peer-id>, /help)", Color::Magenta),
+            Mode::Lobby => ("command (/connect <address>, /help)", Color::Magenta),
         };
         // The cursor's display column (wide glyphs such as CJK/emoji take two
         // cells), and a horizontal scroll that keeps it in view once the line
@@ -770,18 +858,40 @@ fn timestamp_now() -> String {
 /// `peer_name` is the peer's chosen display name, if known; it labels their lines
 /// in place of the generic "peer".
 fn wrapped_lines(line: &ChatLine, width: usize, peer_name: Option<&str>) -> Vec<Line<'static>> {
-    // The safety words get a bespoke layout (numbered grid) rather than the
-    // label-plus-body treatment every other line shares.
-    if matches!(line.author, Author::Safety) {
-        return safety_lines(&line.text, width, &line.timestamp);
+    // The word blocks, address forms, and QR code get bespoke layouts rather
+    // than the label-plus-body treatment every other line shares.
+    match line.author {
+        Author::Safety => {
+            return word_grid_lines(
+                &line.text,
+                width,
+                &line.timestamp,
+                "safety words",
+                SAFETY_ACCENT,
+            );
+        }
+        Author::AddressWords => {
+            return word_grid_lines(
+                &line.text,
+                width,
+                &line.timestamp,
+                "address words",
+                ADDRESS_ACCENT,
+            );
+        }
+        Author::Address => return address_lines(&line.text, width),
+        Author::Qr => return qr_lines(&line.text, width),
+        _ => {}
     }
     let (label, color): (&str, Color) = match line.author {
         Author::You => ("you", Color::Cyan),
         Author::Peer => (peer_name.unwrap_or("peer"), Color::Green),
         Author::System => ("--", Color::DarkGray),
         Author::Warning => ("!!", Color::Red),
-        // Handled by the early return above; kept for exhaustiveness.
-        Author::Safety => ("safety", SAFETY_ACCENT),
+        // Handled by the early returns above; kept for exhaustiveness.
+        Author::Safety | Author::Address | Author::AddressWords | Author::Qr => {
+            unreachable!("bespoke layouts returned early")
+        }
     };
     let time = format!("{} ", line.timestamp);
     let head = format!("{label}: ");
@@ -824,23 +934,32 @@ fn wrapped_lines(line: &ChatLine, width: usize, peer_name: Option<&str>) -> Vec<
         .collect()
 }
 
-/// Render the safety words as a highlighted, numbered grid framed by blank lines.
+/// Render a word phrase as a highlighted, numbered grid framed by blank lines —
+/// the shared layout of the safety words and the word form of an address, kept
+/// visually apart by `header` and `accent` (and the guidance pushed around them).
 ///
-/// Numbering each word lets peers compare by position (so a dropped or swapped
-/// word is obvious), and the accent colour plus bold weight lift the block clear
-/// of the dim system chatter around it. The grid reflows to `width`: as many
-/// columns as fit, collapsing to a single column in a narrow terminal.
-fn safety_lines(phrase: &str, width: usize, timestamp: &str) -> Vec<Line<'static>> {
+/// Numbering each word lets people compare or transcribe by position (so a
+/// dropped or swapped word is obvious), and the accent colour plus bold weight
+/// lift the block clear of the dim system chatter around it. The grid reflows to
+/// `width`: as many columns as fit, collapsing to a single column in a narrow
+/// terminal.
+fn word_grid_lines(
+    phrase: &str,
+    width: usize,
+    timestamp: &str,
+    header: &'static str,
+    accent: Color,
+) -> Vec<Line<'static>> {
     let words: Vec<&str> = phrase.split_whitespace().collect();
     let dim = Style::new().fg(Color::DarkGray);
-    let accent = Style::new().fg(SAFETY_ACCENT).add_modifier(Modifier::BOLD);
+    let accent = Style::new().fg(accent).add_modifier(Modifier::BOLD);
 
     // A blank spacer above, then the header carrying the timestamp prefix.
     let mut lines = vec![
         Line::from(""),
         Line::from(vec![
             Span::styled(format!("{timestamp} "), dim),
-            Span::styled("safety words", accent),
+            Span::styled(header, accent),
         ]),
     ];
 
@@ -872,6 +991,83 @@ fn safety_lines(phrase: &str, width: usize, timestamp: &str) -> Vec<Line<'static
     // A blank spacer below, so the block stands apart from the guidance that follows.
     lines.push(Line::from(""));
     lines
+}
+
+/// The indent, in columns, of a copyable address line — small on purpose, so the
+/// line fits unbroken in terminals as narrow as the address plus two columns.
+const ADDRESS_INDENT: usize = 2;
+
+/// Render one form of our own address as a bare, copyable block: no timestamp or
+/// label prefix (they'd waste width and ride along on a drag-select), a small
+/// indent, wrapping only at the spaces already in the text. A wrapped copy is
+/// still fine — every place an address is entered strips such damage — but the
+/// narrow indent keeps most terminals from wrapping it at all.
+fn address_lines(text: &str, width: usize) -> Vec<Line<'static>> {
+    let avail = width.saturating_sub(ADDRESS_INDENT).max(1);
+    let style = Style::new().fg(ADDRESS_ACCENT).add_modifier(Modifier::BOLD);
+    wrap_text(text, avail)
+        .into_iter()
+        .map(|chunk| {
+            Line::from(vec![
+                Span::raw(" ".repeat(ADDRESS_INDENT)),
+                Span::styled(chunk, style),
+            ])
+        })
+        .collect()
+}
+
+/// Render a QR code (pre-drawn in half-block characters) without ever wrapping
+/// it — a wrapped QR code scans as nothing. In a terminal too narrow to show it,
+/// a note takes its place; the code reappears once the window is widened, since
+/// layout is recomputed from the same history every frame.
+fn qr_lines(qr: &str, width: usize) -> Vec<Line<'static>> {
+    let needed = qr.lines().map(|l| l.chars().count()).max().unwrap_or(0);
+    if needed > width {
+        return vec![Line::from(Span::styled(
+            format!("(the QR code needs {needed} columns — widen the window to show it)"),
+            Style::new().fg(Color::DarkGray),
+        ))];
+    }
+    qr.lines()
+        .map(|l| Line::from(Span::raw(l.to_string())))
+        .collect()
+}
+
+/// Group the `kiss1…` form for reading: the prefix, then the data in blocks of
+/// four — "kiss1 q3f8 x0lm …". The spaces survive a round trip because address
+/// parsing discards separators.
+fn grouped_bech32(bech32: &str) -> String {
+    let (prefix, data) = match bech32.split_once('1') {
+        Some((hrp, data)) => (format!("{hrp}1"), data),
+        None => (String::new(), bech32),
+    };
+    let mut grouped = prefix;
+    for (i, ch) in data.chars().enumerate() {
+        if i % 4 == 0 {
+            grouped.push(' ');
+        }
+        grouped.push(ch);
+    }
+    grouped.trim().to_string()
+}
+
+/// Draw the address as a QR code in Unicode half-block characters, two modules
+/// per character cell.
+///
+/// The bech32 form is uppercased first: the bech32 charset then fits QR
+/// *alphanumeric* mode, which yields a visibly smaller code — and scanners
+/// don't care about case, since address parsing lowercases anyway.
+fn qr_half_blocks(bech32: &str) -> Result<String, qrcode::types::QrError> {
+    use qrcode::render::unicode::Dense1x2;
+    let code = qrcode::QrCode::new(bech32.to_uppercase().as_bytes())?;
+    // Terminals are usually light-on-dark, so paint the *light* modules with the
+    // foreground colour and leave the dark ones to the background: that gives
+    // dark modules on a bright quiet zone, the orientation scanners like best.
+    Ok(code
+        .render::<Dense1x2>()
+        .dark_color(Dense1x2::Light)
+        .light_color(Dense1x2::Dark)
+        .build())
 }
 
 /// Word-wrap `text` to at most `width` characters per line, hard-splitting any
@@ -936,6 +1132,16 @@ mod tests {
         line.spans.iter().map(|s| s.content.as_ref()).collect()
     }
 
+    // A fake own-address: the tests here exercise display and recall, never
+    // encoding, so the forms only have to be recognisable.
+    fn test_address() -> OwnAddress {
+        OwnAddress {
+            hex: "my-addr".into(),
+            bech32: "kiss1testform".into(),
+            words: "alpha beta gamma delta".into(),
+        }
+    }
+
     // Type a whole line and press Enter, returning the resulting action.
     fn submit_line(app: &mut App, line: &str) -> Action {
         for ch in line.chars() {
@@ -953,7 +1159,7 @@ mod tests {
 
     #[test]
     fn connect_command_in_lobby_yields_connect_action() {
-        let mut app = App::new("my-addr".into());
+        let mut app = App::new(test_address());
         match submit_line(&mut app, "/connect abc123") {
             Action::Connect(id) => assert_eq!(id, "abc123"),
             _ => panic!("expected Connect"),
@@ -962,26 +1168,26 @@ mod tests {
 
     #[test]
     fn connect_without_argument_is_rejected() {
-        let mut app = App::new("my-addr".into());
+        let mut app = App::new(test_address());
         assert!(matches!(submit_line(&mut app, "/connect"), Action::None));
     }
 
     #[test]
     fn plain_text_in_lobby_is_not_sent() {
-        let mut app = App::new("my-addr".into());
+        let mut app = App::new(test_address());
         assert!(matches!(submit_line(&mut app, "hello"), Action::None));
     }
 
     #[test]
     fn text_while_verifying_is_not_sent() {
-        let mut app = App::new("my-addr".into());
+        let mut app = App::new(test_address());
         app.set_verifying("peer".into(), "ab-cd".into(), PinStatus::New, None);
         assert!(matches!(submit_line(&mut app, "hi"), Action::None));
     }
 
     #[test]
     fn accept_then_text_is_sent() {
-        let mut app = App::new("my-addr".into());
+        let mut app = App::new(test_address());
         reach_connected(&mut app);
         match submit_line(&mut app, "hi there") {
             Action::Send(line) => assert_eq!(line, "hi there"),
@@ -993,7 +1199,7 @@ mod tests {
     fn an_over_long_message_is_refused_not_sent() {
         // A line past the cap must not be echoed or sent — otherwise it becomes a
         // frame the peer rejects, tearing their session down.
-        let mut app = App::new("my-addr".into());
+        let mut app = App::new(test_address());
         reach_connected(&mut app);
         let long = "a".repeat(message::MAX_MESSAGE_CHARS + 1);
         assert!(matches!(submit_line(&mut app, &long), Action::None));
@@ -1011,7 +1217,7 @@ mod tests {
     #[test]
     fn double_slash_escapes_a_leading_slash_in_a_message() {
         // "//shrug" must be sent verbatim as "/shrug", not parsed as a command.
-        let mut app = App::new("my-addr".into());
+        let mut app = App::new(test_address());
         reach_connected(&mut app);
         match submit_line(&mut app, "//shrug") {
             Action::Send(line) => assert_eq!(line, "/shrug"),
@@ -1028,7 +1234,7 @@ mod tests {
     #[test]
     fn a_single_slash_still_routes_as_a_command() {
         // The escape must not disturb ordinary command parsing.
-        let mut app = App::new("my-addr".into());
+        let mut app = App::new(test_address());
         match submit_line(&mut app, "/connect abc123") {
             Action::Connect(id) => assert_eq!(id, "abc123"),
             _ => panic!("expected a single slash to route as a command"),
@@ -1037,7 +1243,7 @@ mod tests {
 
     #[test]
     fn a_message_at_the_cap_is_sent() {
-        let mut app = App::new("my-addr".into());
+        let mut app = App::new(test_address());
         reach_connected(&mut app);
         let at_cap = "a".repeat(message::MAX_MESSAGE_CHARS);
         assert!(matches!(submit_line(&mut app, &at_cap), Action::Send(_)));
@@ -1047,7 +1253,7 @@ mod tests {
     fn accepting_waits_for_the_peer_before_opening_chat() {
         // Our /accept alone must not open the chat: the peer hasn't accepted yet,
         // so anything sent now could not be shown by them.
-        let mut app = App::new("my-addr".into());
+        let mut app = App::new(test_address());
         app.set_verifying("peer".into(), "ab-cd".into(), PinStatus::New, None);
         let _ = submit_line(&mut app, "/accept");
         assert_eq!(app.mode, Mode::WaitingPeer);
@@ -1062,7 +1268,7 @@ mod tests {
     fn a_peer_accepting_first_opens_chat_on_our_accept() {
         // The other ordering: they accept while we're still verifying, so our
         // /accept completes the mutual acceptance and opens chat immediately.
-        let mut app = App::new("my-addr".into());
+        let mut app = App::new(test_address());
         app.set_verifying("peer".into(), "ab-cd".into(), PinStatus::New, None);
         let flushed = app.mark_peer_accepted();
         assert!(
@@ -1080,7 +1286,7 @@ mod tests {
     fn lines_typed_while_waiting_are_held_and_flushed_in_order() {
         // The message-loss window this release closes: text typed after our accept
         // but before the peer's must reach them, not vanish.
-        let mut app = App::new("my-addr".into());
+        let mut app = App::new(test_address());
         app.set_verifying("peer".into(), "ab-cd".into(), PinStatus::New, None);
         let _ = submit_line(&mut app, "/accept");
 
@@ -1100,7 +1306,7 @@ mod tests {
 
     #[test]
     fn held_lines_are_discarded_when_the_channel_never_opens() {
-        let mut app = App::new("my-addr".into());
+        let mut app = App::new(test_address());
         app.set_verifying("peer".into(), "ab-cd".into(), PinStatus::New, None);
         let _ = submit_line(&mut app, "/accept");
         let _ = submit_line(&mut app, "held");
@@ -1114,7 +1320,7 @@ mod tests {
 
     #[test]
     fn an_over_long_message_is_refused_while_waiting_too() {
-        let mut app = App::new("my-addr".into());
+        let mut app = App::new(test_address());
         app.set_verifying("peer".into(), "ab-cd".into(), PinStatus::New, None);
         let _ = submit_line(&mut app, "/accept");
         let long = "a".repeat(message::MAX_MESSAGE_CHARS + 1);
@@ -1128,7 +1334,7 @@ mod tests {
     #[test]
     fn reject_is_allowed_while_waiting_on_the_peer() {
         // Having accepted must not trap the user in a half-open channel.
-        let mut app = App::new("my-addr".into());
+        let mut app = App::new(test_address());
         app.set_verifying("peer".into(), "ab-cd".into(), PinStatus::New, None);
         let _ = submit_line(&mut app, "/accept");
         assert!(matches!(
@@ -1139,7 +1345,7 @@ mod tests {
 
     #[test]
     fn reject_yields_reject_action() {
-        let mut app = App::new("my-addr".into());
+        let mut app = App::new(test_address());
         app.set_verifying("peer".into(), "ab-cd".into(), PinStatus::New, None);
         assert!(matches!(
             submit_line(&mut app, "/reject"),
@@ -1149,14 +1355,14 @@ mod tests {
 
     #[test]
     fn accept_while_verifying_yields_accept_action() {
-        let mut app = App::new("my-addr".into());
+        let mut app = App::new(test_address());
         app.set_verifying("peer".into(), "ab-cd".into(), PinStatus::New, None);
         assert!(matches!(submit_line(&mut app, "/accept"), Action::Accept));
     }
 
     #[test]
     fn changed_identity_key_raises_a_warning_during_verification() {
-        let mut app = App::new("my-addr".into());
+        let mut app = App::new(test_address());
         app.set_verifying("peer".into(), "ab-cd".into(), PinStatus::Changed, None);
         assert!(
             app.history
@@ -1168,7 +1374,7 @@ mod tests {
 
     #[test]
     fn recognised_peer_is_noted_without_a_warning() {
-        let mut app = App::new("my-addr".into());
+        let mut app = App::new(test_address());
         app.set_verifying("peer".into(), "ab-cd".into(), PinStatus::Known, None);
         assert!(app.history.iter().any(|l| l.text.contains("recognised")));
         assert!(
@@ -1181,7 +1387,7 @@ mod tests {
 
     #[test]
     fn recognised_peer_shows_its_cached_name() {
-        let mut app = App::new("my-addr".into());
+        let mut app = App::new(test_address());
         app.set_verifying(
             "peer".into(),
             "ab-cd".into(),
@@ -1200,7 +1406,7 @@ mod tests {
     fn recognised_peer_skips_the_safety_word_ritual() {
         // A known peer is asked only for consent — the safety-word block is not shown
         // up front, and the prompt reads as an incoming-connection consent.
-        let mut app = App::new("my-addr".into());
+        let mut app = App::new(test_address());
         app.set_verifying("peer".into(), "ab-cd".into(), PinStatus::Known, None);
         assert!(
             !app.history
@@ -1219,7 +1425,7 @@ mod tests {
     #[test]
     fn a_new_or_changed_peer_is_shown_the_safety_words() {
         for pin in [PinStatus::New, PinStatus::Changed] {
-            let mut app = App::new("my-addr".into());
+            let mut app = App::new(test_address());
             app.set_verifying("peer".into(), "ab-cd".into(), pin, None);
             assert!(
                 app.history
@@ -1233,7 +1439,7 @@ mod tests {
     #[test]
     fn recognised_peer_still_requires_explicit_accept() {
         // The consent gate stands: a recognised peer can't force us straight into chat.
-        let mut app = App::new("my-addr".into());
+        let mut app = App::new(test_address());
         app.set_verifying("peer".into(), "ab-cd".into(), PinStatus::Known, None);
         // Typing plain text does not slip past the gate.
         assert!(matches!(submit_line(&mut app, "hi"), Action::None));
@@ -1244,7 +1450,7 @@ mod tests {
     #[test]
     fn safety_command_reshows_words_for_a_recognised_peer() {
         // Even when the ritual is skipped, the user can pull the words up on demand.
-        let mut app = App::new("my-addr".into());
+        let mut app = App::new(test_address());
         app.set_verifying("peer".into(), "ab-cd".into(), PinStatus::Known, None);
         assert!(
             !app.history
@@ -1262,7 +1468,7 @@ mod tests {
 
     #[test]
     fn contacts_command_yields_a_list_action() {
-        let mut app = App::new("my-addr".into());
+        let mut app = App::new(test_address());
         assert!(matches!(
             submit_line(&mut app, "/contacts"),
             Action::ListContacts
@@ -1271,13 +1477,13 @@ mod tests {
 
     #[test]
     fn accept_outside_verifying_does_nothing() {
-        let mut app = App::new("my-addr".into());
+        let mut app = App::new(test_address());
         assert!(matches!(submit_line(&mut app, "/accept"), Action::None));
     }
 
     #[test]
     fn name_command_keeps_spaces_and_reports_the_whole_name() {
-        let mut app = App::new("my-addr".into());
+        let mut app = App::new(test_address());
         match submit_line(&mut app, "/name Alice Smith") {
             Action::SetName(name) => assert_eq!(name, "Alice Smith"),
             _ => panic!("expected SetName"),
@@ -1286,7 +1492,7 @@ mod tests {
 
     #[test]
     fn bare_name_command_clears_the_name() {
-        let mut app = App::new("my-addr".into());
+        let mut app = App::new(test_address());
         match submit_line(&mut app, "/name") {
             Action::SetName(name) => assert!(name.is_empty()),
             _ => panic!("expected SetName with an empty argument"),
@@ -1308,7 +1514,7 @@ mod tests {
 
     #[test]
     fn peer_name_shows_in_the_connected_status() {
-        let mut app = App::new("my-addr".into());
+        let mut app = App::new(test_address());
         reach_connected(&mut app);
         app.set_peer_name(Some("Alice".into()));
         assert!(app.status.contains("Alice"));
@@ -1319,7 +1525,7 @@ mod tests {
 
     #[test]
     fn connect_while_connected_switches_peers() {
-        let mut app = App::new("my-addr".into());
+        let mut app = App::new(test_address());
         reach_connected(&mut app);
         match submit_line(&mut app, "/connect newpeer") {
             Action::Connect(id) => assert_eq!(id, "newpeer"),
@@ -1329,7 +1535,7 @@ mod tests {
 
     #[test]
     fn connect_is_refused_while_dialing() {
-        let mut app = App::new("my-addr".into());
+        let mut app = App::new(test_address());
         app.set_connecting("peer".into());
         assert!(matches!(
             submit_line(&mut app, "/connect abc"),
@@ -1339,7 +1545,7 @@ mod tests {
 
     #[test]
     fn connect_is_refused_while_verifying() {
-        let mut app = App::new("my-addr".into());
+        let mut app = App::new(test_address());
         app.set_verifying("peer".into(), "ab-cd".into(), PinStatus::New, None);
         assert!(matches!(
             submit_line(&mut app, "/connect abc"),
@@ -1349,7 +1555,7 @@ mod tests {
 
     #[test]
     fn clear_command_empties_the_history() {
-        let mut app = App::new("my-addr".into());
+        let mut app = App::new(test_address());
         assert!(!app.history.is_empty());
         assert!(matches!(submit_line(&mut app, "/clear"), Action::None));
         assert!(app.history.is_empty());
@@ -1357,7 +1563,7 @@ mod tests {
 
     #[test]
     fn version_command_reports_the_crate_version() {
-        let mut app = App::new("my-addr".into());
+        let mut app = App::new(test_address());
         assert!(matches!(submit_line(&mut app, "/version"), Action::None));
         assert!(
             app.history
@@ -1366,7 +1572,7 @@ mod tests {
             "/version should report the crate version"
         );
         // The /v alias behaves identically.
-        let mut app = App::new("my-addr".into());
+        let mut app = App::new(test_address());
         let _ = submit_line(&mut app, "/v");
         assert!(
             app.history
@@ -1377,7 +1583,7 @@ mod tests {
 
     #[test]
     fn address_command_recalls_own_address_after_clear() {
-        let mut app = App::new("my-addr".into());
+        let mut app = App::new(test_address());
         let _ = submit_line(&mut app, "/clear");
         assert!(app.history.is_empty());
         assert!(matches!(submit_line(&mut app, "/address"), Action::None));
@@ -1386,18 +1592,18 @@ mod tests {
 
     #[test]
     fn quit_command_and_ctrl_c_both_quit() {
-        let mut app = App::new("my-addr".into());
+        let mut app = App::new(test_address());
         assert!(matches!(submit_line(&mut app, "/quit"), Action::Quit));
         assert!(app.should_quit);
 
-        let mut app = App::new("my-addr".into());
+        let mut app = App::new(test_address());
         let ctrl_c = KeyEvent::new(KeyCode::Char('c'), KeyModifiers::CONTROL);
         assert!(matches!(app.on_key(ctrl_c), Action::Quit));
     }
 
     #[test]
     fn cursor_editing_inserts_in_the_middle() {
-        let mut app = App::new("my-addr".into());
+        let mut app = App::new(test_address());
         for ch in "helo".chars() {
             app.on_key(KeyEvent::new(KeyCode::Char(ch), KeyModifiers::empty()));
         }
@@ -1410,7 +1616,7 @@ mod tests {
 
     #[test]
     fn ctrl_u_clears_the_input() {
-        let mut app = App::new("my-addr".into());
+        let mut app = App::new(test_address());
         for ch in "noise".chars() {
             app.on_key(KeyEvent::new(KeyCode::Char(ch), KeyModifiers::empty()));
         }
@@ -1484,5 +1690,177 @@ mod tests {
         let wrapped = wrap_text("supercalifragilistic", 5);
         assert!(wrapped.iter().all(|l| l.chars().count() <= 5));
         assert_eq!(wrapped.concat(), "supercalifragilistic");
+    }
+
+    #[test]
+    fn connect_takes_the_whole_rest_of_the_line() {
+        // The word form of an address is 24 whitespace-separated words; a
+        // single-token /connect would silently drop 23 of them.
+        let mut app = App::new(test_address());
+        match submit_line(&mut app, "/connect alpha bravo charlie delta") {
+            Action::Connect(addr) => assert_eq!(addr, "alpha bravo charlie delta"),
+            _ => panic!("expected Connect with the full phrase"),
+        }
+    }
+
+    #[test]
+    fn address_words_shows_the_words_and_disclaims_safety() {
+        let mut app = App::new(test_address());
+        assert!(matches!(
+            submit_line(&mut app, "/address words"),
+            Action::None
+        ));
+        assert!(
+            app.history
+                .iter()
+                .any(|l| matches!(l.author, Author::AddressWords) && l.text.contains("alpha")),
+            "the word block should carry the word form"
+        );
+        assert!(
+            app.history
+                .iter()
+                .any(|l| l.text.contains("NOT safety words")),
+            "the block must be explicitly distinguished from the safety words"
+        );
+    }
+
+    #[test]
+    fn address_words_render_under_their_own_header() {
+        // The grid layout is shared with the safety words; the header is one of
+        // the things keeping the two blocks unmistakable.
+        let line = ChatLine {
+            author: Author::AddressWords,
+            text: "alpha bravo charlie".into(),
+            timestamp: "12:00".into(),
+        };
+        let blob = render_blob(&line, 80);
+        assert!(blob.contains("address words"));
+        assert!(!blob.contains("safety words"));
+        assert!(blob.contains("1 alpha"), "words should be numbered");
+    }
+
+    #[test]
+    fn address_command_shows_both_string_forms() {
+        let mut app = App::new(test_address());
+        let _ = submit_line(&mut app, "/clear");
+        assert!(matches!(submit_line(&mut app, "/address"), Action::None));
+        let addresses: Vec<&str> = app
+            .history
+            .iter()
+            .filter(|l| matches!(l.author, Author::Address))
+            .map(|l| l.text.as_str())
+            .collect();
+        assert!(
+            addresses.iter().any(|t| t.starts_with("kiss1")),
+            "missing the kiss1… form: {addresses:?}"
+        );
+        assert!(
+            addresses.contains(&"my-addr"),
+            "missing the legacy hex form: {addresses:?}"
+        );
+    }
+
+    #[test]
+    fn address_lines_are_bare_and_wrap_at_group_boundaries() {
+        let line = ChatLine {
+            author: Author::Address,
+            text: "kiss1 abcd efgh ijkl".into(),
+            timestamp: "12:00".into(),
+        };
+        // Wide enough: one line, no timestamp or label — just the indent.
+        let wide = wrapped_lines(&line, 80, None);
+        assert_eq!(wide.len(), 1);
+        assert_eq!(line_text(&wide[0]), "  kiss1 abcd efgh ijkl");
+        assert!(!line_text(&wide[0]).contains("12:00"));
+
+        // Too narrow: wraps only at the group boundaries, never mid-group.
+        let narrow = wrapped_lines(&line, 13, None);
+        for rendered in &narrow {
+            let text = line_text(rendered);
+            assert!(
+                text.split_whitespace().all(|g| line.text.contains(g)),
+                "a group was split mid-token: {text:?}"
+            );
+        }
+        let rejoined: Vec<String> = narrow
+            .iter()
+            .map(|l| line_text(l).trim().to_string())
+            .collect();
+        assert_eq!(rejoined.join(" "), line.text);
+    }
+
+    #[test]
+    fn grouped_bech32_groups_after_the_prefix() {
+        assert_eq!(grouped_bech32("kiss1abcdefghij"), "kiss1 abcd efgh ij");
+        // Degenerate input without a separator still comes out grouped.
+        assert_eq!(grouped_bech32("abcdefgh"), "abcd efgh");
+    }
+
+    #[test]
+    fn qr_command_pushes_a_scannable_block() {
+        let mut app = App::new(test_address());
+        assert!(matches!(submit_line(&mut app, "/qr"), Action::None));
+        let qr = app
+            .history
+            .iter()
+            .find(|l| matches!(l.author, Author::Qr))
+            .expect("a QR block should have been pushed");
+        assert!(qr.text.contains('\n'), "a QR code is a multi-line block");
+        assert!(
+            qr.text.contains('█') || qr.text.contains('▀') || qr.text.contains('▄'),
+            "the QR code should be drawn in half-block characters"
+        );
+    }
+
+    #[test]
+    fn a_qr_block_is_never_wrapped() {
+        let line = ChatLine {
+            author: Author::Qr,
+            text: qr_half_blocks("kiss1testform").unwrap(),
+            timestamp: "12:00".into(),
+        };
+        let needed = line.text.lines().map(|l| l.chars().count()).max().unwrap();
+
+        // Wide enough: rendered verbatim, one Line per row.
+        let wide = wrapped_lines(&line, needed, None);
+        assert_eq!(wide.len(), line.text.lines().count());
+
+        // One column short: replaced by a note, not sheared into garbage.
+        let narrow = wrapped_lines(&line, needed - 1, None);
+        assert_eq!(narrow.len(), 1);
+        assert!(line_text(&narrow[0]).contains("widen the window"));
+    }
+
+    #[test]
+    fn pasting_newlines_never_submits() {
+        // A wrapped address copied out of a terminal arrives with newlines; fed
+        // through the key path those would be Enter presses, firing off half the
+        // input as a message. on_paste folds them to spaces instead.
+        let mut app = App::new(test_address());
+        reach_connected(&mut app);
+        app.on_paste("first line\r\nsecond\tline\r");
+        assert!(
+            !app.history.iter().any(|l| matches!(l.author, Author::You)),
+            "a paste must never send anything on its own"
+        );
+        assert_eq!(app.input, "first line second line ");
+
+        // Enter afterwards sends the whole thing as one message.
+        match app.on_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::empty())) {
+            Action::Send(line) => assert_eq!(line, "first line second line"),
+            _ => panic!("expected the folded paste to send as one message"),
+        }
+    }
+
+    #[test]
+    fn pasting_into_the_middle_respects_the_cursor() {
+        let mut app = App::new(test_address());
+        for ch in "ad".chars() {
+            app.on_key(KeyEvent::new(KeyCode::Char(ch), KeyModifiers::empty()));
+        }
+        app.on_key(KeyEvent::new(KeyCode::Left, KeyModifiers::empty()));
+        app.on_paste("bc");
+        assert_eq!(app.input, "abcd");
+        assert_eq!(app.cursor, 3);
     }
 }

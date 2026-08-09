@@ -9,7 +9,7 @@
 //!
 //! ```text
 //! kiss_chat                     come up in the lobby: share your address, then wait or /connect
-//! kiss_chat <ADDRESS>           come up and immediately dial that peer (an iroh EndpointId)
+//! kiss_chat <ADDRESS>           come up and immediately dial that peer (hex, kiss1…, or 24 words)
 //! kiss_chat --config-dir <DIR>  keep this session's identity in DIR instead of the default
 //! kiss_chat --headless …        speak newline-delimited JSON on stdio instead of drawing a UI
 //! kiss_chat --version           print the version and exit (also -v)
@@ -21,11 +21,12 @@
 //!
 //! | Command | Description |
 //! | --- | --- |
-//! | `/connect <peer-id>` | dial a peer (switches peers if already connected) |
+//! | `/connect <address>` | dial a peer (switches peers if already connected) |
 //! | `/accept`, `/reject` | accept or reject a peer after comparing the safety words |
 //! | `/safety` | re-show the current session's safety words |
 //! | `/contacts` | list the peers you've accepted before |
-//! | `/address` | show your own address to share |
+//! | `/address [words]` | show your own address to share (`words` for the 24-word form) |
+//! | `/qr` | show your own address as a QR code |
 //! | `/name [text]` | set your (optional) display name; only shared after `/accept` |
 //! | `/clear` | clear the screen |
 //! | `/version` | show the version (also `/v`) |
