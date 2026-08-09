@@ -157,6 +157,55 @@ fn help_and_version_describe_the_headless_mode() {
     );
 }
 
+/// Starting up must not depend on a roomy main-thread stack.
+///
+/// Building a post-quantum identity needs a lot of stack, and Windows gives a
+/// process's main thread only 1 MiB — so running the app there crashes before it
+/// can emit anything, a failure invisible on Linux and macOS (8 MiB) until CI's
+/// Windows leg says so. Constraining the limit here reproduces that condition on
+/// any unix, which is where this is most likely to be noticed early.
+#[cfg(unix)]
+#[test]
+fn startup_survives_a_one_megabyte_main_thread_stack() {
+    // `exec` so the limit applies to kiss_chat itself, not just the shell.
+    let script = format!(
+        "ulimit -s 1024 2>/dev/null || exit 99; exec '{}' --headless --ephemeral",
+        BIN.replace('\'', r"'\''")
+    );
+    let mut child = Command::new("sh")
+        .arg("-c")
+        .arg(&script)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .spawn()
+        .expect("spawn kiss_chat under a reduced stack limit");
+
+    let mut stdout = BufReader::new(child.stdout.take().expect("stdout"));
+    let mut line = String::new();
+    stdout.read_line(&mut line).ok();
+
+    if line.is_empty() {
+        // Either the shell refused the limit (exit 99) or startup crashed. Only
+        // the first is acceptable, and only on a platform that won't let us ask.
+        drop(child.stdin.take());
+        let status = wait_for_exit(&mut child);
+        assert_eq!(
+            status.code(),
+            Some(99),
+            "kiss_chat produced no output under a 1 MiB main-thread stack — \
+             it is doing heavy work on the main thread again, which is fatal on Windows"
+        );
+        return;
+    }
+
+    let ready: serde_json::Value =
+        serde_json::from_str(&line).expect("startup must emit a ready line, not crash");
+    assert_eq!(ready["event"], "ready");
+
+    drop(child.stdin.take());
+    assert_eq!(wait_for_exit(&mut child).code(), Some(0));
+}
+
 #[test]
 fn a_persistent_identity_survives_a_restart() {
     // The property an application depends on when it wants a stable address to

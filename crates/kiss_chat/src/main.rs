@@ -45,12 +45,22 @@ mod ui;
 
 use std::process::ExitCode;
 
-use anyhow::Result;
+use anyhow::{Context, Result};
 
 use cli::Invocation;
 
-#[tokio::main]
-async fn main() -> Result<ExitCode> {
+/// Stack size for the thread the application runs on, and for tokio's workers.
+///
+/// The post-quantum key material is large, and building an ML-DSA-87 identity
+/// needs far more stack than a modest default allows — especially in an
+/// unoptimised build, where the compiler keeps intermediates alive. Windows gives
+/// a process's *main* thread only 1 MiB, which is not enough, so we don't run on
+/// it: everything happens on a thread we size ourselves. The reservation is
+/// virtual, so asking for more than we use costs nothing.
+const STACK_SIZE: usize = 8 * 1024 * 1024;
+
+fn main() -> Result<ExitCode> {
+    // Parse before spawning, so a usage error costs nothing and prints from here.
     let invocation = match cli::parse(std::env::args().skip(1)) {
         Ok(invocation) => invocation,
         Err(message) => {
@@ -60,6 +70,25 @@ async fn main() -> Result<ExitCode> {
         }
     };
 
+    let worker = std::thread::Builder::new()
+        .name("kiss_chat".into())
+        .stack_size(STACK_SIZE)
+        .spawn(move || {
+            let runtime = tokio::runtime::Builder::new_multi_thread()
+                .enable_all()
+                .thread_stack_size(STACK_SIZE)
+                .build()
+                .context("failed to start the async runtime")?;
+            runtime.block_on(run(invocation))
+        })
+        .context("failed to start the main thread")?;
+
+    // A panic on that thread has already printed its message; propagate it as the
+    // conventional panic exit code rather than swallowing it into a success.
+    worker.join().unwrap_or(Ok(ExitCode::from(101)))
+}
+
+async fn run(invocation: Invocation) -> Result<ExitCode> {
     match invocation {
         Invocation::Help => {
             app::print_usage();
