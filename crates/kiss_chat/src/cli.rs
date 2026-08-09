@@ -80,10 +80,16 @@ where
                 return Err(format!("unknown option: {other}"));
             }
             other => {
-                if peer.is_some() {
-                    return Err(format!("unexpected extra argument: {other}"));
+                // Bare arguments are gathered into one peer address rather than
+                // capped at one: the word form of an address is 24 words, and
+                // demanding quotes around them would be a paper cut.
+                match &mut peer {
+                    Some(peer) => {
+                        peer.push(' ');
+                        peer.push_str(other);
+                    }
+                    None => peer = Some(other.to_string()),
                 }
-                peer = Some(other.to_string());
             }
         }
     }
@@ -321,7 +327,27 @@ mod tests {
     }
 
     #[test]
-    fn a_second_bare_argument_is_refused() {
-        assert!(parse_err(&["one", "two"]).contains("extra argument"));
+    fn bare_arguments_join_into_one_peer_address() {
+        // The word form of an address arrives as many bare arguments; they must
+        // be gathered, not refused, so it needn't be quoted.
+        assert_eq!(
+            parse_ok(&["alpha", "beta", "gamma"]),
+            Invocation::Tui {
+                config_dir: None,
+                peer: Some("alpha beta gamma".into()),
+            }
+        );
+    }
+
+    #[test]
+    fn flags_interleave_with_a_word_form_peer() {
+        // Flags keep their meaning wherever they appear among the words.
+        assert_eq!(
+            parse_ok(&["alpha", "--config-dir", "/tmp/kc", "beta"]),
+            Invocation::Tui {
+                config_dir: Some(PathBuf::from("/tmp/kc")),
+                peer: Some("alpha beta".into()),
+            }
+        );
     }
 }
