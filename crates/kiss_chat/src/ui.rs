@@ -1,8 +1,9 @@
 //! Terminal UI state: a scrolling history above a single input line.
 //!
 //! This module is pure state + rendering + key interpretation. It never touches
-//! crypto or the network — the main loop drives it, feeding in [`NetEvent`]s and
-//! acting on the [`Action`]s that key presses produce.
+//! crypto or the network — the main loop drives it, feeding in
+//! [`NetEvent`](crate::net::NetEvent)s and acting on the [`Action`]s that key
+//! presses produce.
 //!
 //! The input line is a command prompt (`/connect`, `/help`, `/quit`) until a peer
 //! is connected. When a channel comes up the app holds it in a **verify** gate: a
@@ -29,16 +30,6 @@ const SCROLL_STEP: usize = 5;
 
 /// The crate version, shown in the frame title and reported by `/version`.
 const VERSION: &str = env!("CARGO_PKG_VERSION");
-
-/// An event flowing from the network tasks into the UI.
-pub enum NetEvent {
-    /// A decrypted message from the peer.
-    Message(String),
-    /// The peer shared (or, with `None`, cleared) their display name.
-    PeerName(Option<String>),
-    /// The session ended; carries a human-readable reason.
-    Disconnected(String),
-}
 
 /// What a key press asked for, interpreted by the main loop.
 pub enum Action {

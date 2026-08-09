@@ -30,6 +30,7 @@
 //! | `/quit` | exit (also `Esc` / `Ctrl-C`) |
 
 mod app;
+mod net;
 mod ui;
 
 use anyhow::Result;
