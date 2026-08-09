@@ -17,7 +17,7 @@
 //!
 //! | Event | Fields | When |
 //! | --- | --- | --- |
-//! | `ready` | `proto`, `address`, `fingerprint`, `name`, `direct_addrs` | Once, after binding. Everything needed to build an invitation. |
+//! | `ready` | `proto`, `address`, `fingerprint`, `name`, `direct_addrs` | Once, after binding. Everything needed to build an invitation. `direct_addrs` is best-effort and may be empty this early — an `address` is all a peer needs. |
 //! | `connecting` | `peer` | A dial started. |
 //! | `verify` | `peer`, `words`, `fingerprint`, `pin`, `known_name` | A channel is up and awaiting an accept/reject decision. |
 //! | `accepted` | `peer`, `fingerprint` | *We* accepted; the peer has been told. |
@@ -390,6 +390,8 @@ async fn event_loop(
                         if let Some(old) = session.take() {
                             old.reader.abort();
                             tokio::spawn(farewell(old.conn, old.outgoing_tx, old.writer));
+                            stage = Stage::Verifying;
+                            peer_accepted = false;
                             sink.emit(&Event::Disconnected {
                                 reason: "left the chat to connect elsewhere".into(),
                             }).await?;
@@ -419,6 +421,9 @@ async fn event_loop(
                         if let Some(old) = session.take() {
                             old.reader.abort();
                             tokio::spawn(farewell(old.conn, old.outgoing_tx, old.writer));
+                            // Leave no acceptance state behind for the next channel.
+                            stage = Stage::Verifying;
+                            peer_accepted = false;
                             accept_handle = arm_accept(endpoint, my_id, auth_seed, &conn_tx);
                             sink.emit(&Event::Disconnected {
                                 reason: "rejected the peer".into(),
@@ -688,6 +693,10 @@ fn set_contact_name(identity: &Identity, address: &str, name: Option<&str>) {
 
 /// The endpoint's directly reachable socket addresses, as `ip:port` strings, so a
 /// controller can pass them to a peer that should dial without discovery.
+///
+/// Best-effort: shortly after binding the endpoint may not know any yet, and the
+/// list is empty. That costs nothing — dialling by address alone is the normal
+/// path — so it isn't worth delaying the `ready` event to wait for them.
 fn direct_addrs(endpoint: &Endpoint) -> Vec<String> {
     endpoint
         .addr()

@@ -236,7 +236,7 @@ ends — the natural fit for "one game, one process"), and a bare peer address t
 
 | Event | Fields | When |
 |-------|--------|------|
-| `ready` | `proto`, `address`, `fingerprint`, `name`, `direct_addrs` | Once, after binding. Everything you need to build an invitation. |
+| `ready` | `proto`, `address`, `fingerprint`, `name`, `direct_addrs` | Once, after binding. Everything you need to build an invitation. (`direct_addrs` is a best-effort convenience for dialling without discovery, and may be empty this early — the `address` is what peers actually need.) |
 | `connecting` | `peer` | A dial started. |
 | `verify` | `peer`, `words`, `fingerprint`, `pin`, `known_name` | A channel is up, awaiting your accept/reject. `pin` is `new`, `known`, or `changed`. |
 | `accepted` | `peer`, `fingerprint` | *You* accepted; the peer has been told. |
