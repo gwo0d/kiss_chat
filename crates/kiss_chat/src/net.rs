@@ -44,6 +44,9 @@ pub enum NetEvent {
     Message(String),
     /// The peer shared (or, with `None`, cleared) their display name.
     PeerName(Option<String>),
+    /// The peer accepted the channel — their half of the mutual acceptance the
+    /// session needs before chat may flow (see [`kiss_chat_core::message`]).
+    PeerAccepted,
     /// The session ended; carries a human-readable reason.
     Disconnected(String),
 }
@@ -229,6 +232,10 @@ async fn accept_and_handshake(
 ///
 /// `net_tx` is bounded, so a slow frontend stalls this `send`, which stops us
 /// reading the next frame and lets QUIC flow control throttle a flooding peer.
+///
+/// A frame carrying a tag this version doesn't know is skipped rather than treated
+/// as fatal, which is what lets later versions add frames without a coordinated
+/// break; only a genuinely undecodable frame ends the session.
 pub fn spawn_reader(
     mut recv: RecvStream,
     mut opener: Opener,
@@ -241,6 +248,10 @@ pub fn spawn_reader(
                     Ok(plaintext) => match message::decode(&plaintext) {
                         message::Incoming::Text(text) => NetEvent::Message(text),
                         message::Incoming::Name(name) => NetEvent::PeerName(name),
+                        message::Incoming::Accepted => NetEvent::PeerAccepted,
+                        // A frame from a newer peer that we don't understand:
+                        // skip it and keep the session running.
+                        message::Incoming::Unknown => continue,
                         message::Incoming::Bye => {
                             NetEvent::Disconnected("peer left the chat".into())
                         }

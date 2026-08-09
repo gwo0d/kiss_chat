@@ -18,7 +18,18 @@ use iroh::{Endpoint, EndpointAddr, SecretKey};
 use crate::identity;
 
 /// Application-layer protocol identifier negotiated during the QUIC handshake.
-pub const ALPN: &[u8] = b"kiss-chat/0";
+///
+/// This doubles as kiss_chat's **wire version**. QUIC refuses a connection whose
+/// ALPNs don't match, so peers running incompatible wire protocols fail cleanly at
+/// dial time instead of connecting and then misinterpreting each other's frames.
+///
+/// Bump it only for a change that an older peer would *misread*. Since
+/// [`crate::message`] ignores frame tags it doesn't recognise, adding a new frame
+/// type is not such a change — it is compatible within a version.
+///
+/// History: `kiss-chat/0` up to 0.6.x; `kiss-chat/1` from 0.7.0, which added the
+/// mutual-acceptance handshake and unknown-frame tolerance.
+pub const ALPN: &[u8] = b"kiss-chat/1";
 
 /// Bind an endpoint using the N0 preset (relay + DNS discovery enabled), which
 /// lets peers be reached by [`EndpointId`] alone.
@@ -103,8 +114,14 @@ mod tests {
     // Bind a discovery-free, relay-free endpoint pinned to loopback so the test
     // runs entirely through localhost without touching any external network.
     async fn bind_local() -> Endpoint {
+        bind_local_speaking(ALPN).await
+    }
+
+    // As above, but speaking an explicit ALPN — used to stand in for a peer on a
+    // different wire version.
+    async fn bind_local_speaking(alpn: &[u8]) -> Endpoint {
         Endpoint::builder(presets::Minimal)
-            .alpns(vec![ALPN.to_vec()])
+            .alpns(vec![alpn.to_vec()])
             .bind_addr("127.0.0.1:0")
             .expect("valid bind addr")
             .bind()
@@ -263,5 +280,114 @@ mod tests {
         .await;
 
         outcome.expect("test timed out — iroh could not connect over loopback");
+    }
+
+    /// A peer that accepts and immediately starts talking must have its `Accepted`
+    /// arrive *before* its chat text, with nothing lost in between.
+    ///
+    /// This is the ordering the mutual-acceptance rule rests on: it lets the
+    /// receiver treat pre-acceptance text as a protocol violation (rather than
+    /// silently discarding it, which is how messages went missing before 0.7.0)
+    /// without ever misjudging a well-behaved peer that was simply quicker to
+    /// accept.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn acceptance_precedes_chat_text_over_loopback() {
+        let outcome = tokio::time::timeout(Duration::from_secs(30), async {
+            let server = bind_local().await;
+            let client = bind_local().await;
+            let server_id = server.id();
+            let server_addr = dialable_addr(&server).await;
+
+            // Server: handshake, then read the next two frames in order — standing
+            // in for a user who accepts *after* the peer has already done so.
+            let server_task = tokio::spawn(async move {
+                let (conn, mut send, mut recv) = accept(&server).await.unwrap();
+                let peer = conn.remote_id();
+                let msg1 = proto::read_frame(&mut recv).await.unwrap();
+                let (pending, msg2) = crypto::responder_receive(
+                    &msg1,
+                    peer.as_bytes(),
+                    server.id().as_bytes(),
+                    SigningIdentity::from_seed(&[2u8; 32]),
+                )
+                .unwrap();
+                proto::write_frame(&mut send, &msg2).await.unwrap();
+                let msg3 = proto::read_frame(&mut recv).await.unwrap();
+                let session = pending.finish(&msg3).unwrap();
+
+                let (_sealer, mut opener) = session.split();
+                let mut received = Vec::new();
+                for _ in 0..2 {
+                    let frame = proto::read_frame(&mut recv).await.unwrap();
+                    received.push(message::decode(&opener.open(&frame).unwrap()));
+                }
+                // Nothing is sent back, so there's no need to outlive the client's
+                // close — and waiting for it here would deadlock against a client
+                // that closes only once this task has reported what it read.
+                drop(conn);
+                received
+            });
+
+            // Client: handshake, accept, then immediately send a message.
+            let (conn, mut send, mut recv) = dial(&client, server_addr).await.unwrap();
+            let initiator = crypto::initiator_start(SigningIdentity::from_seed(&[1u8; 32]));
+            proto::write_frame(&mut send, initiator.msg1())
+                .await
+                .unwrap();
+            let msg2 = proto::read_frame(&mut recv).await.unwrap();
+            let (session, msg3) = initiator
+                .finish(&msg2, client.id().as_bytes(), server_id.as_bytes())
+                .unwrap();
+            proto::write_frame(&mut send, &msg3).await.unwrap();
+
+            let (mut sealer, _opener) = session.split();
+            for outgoing in [
+                message::Outgoing::Accepted,
+                message::Outgoing::Text("first move".into()),
+            ] {
+                let frame = sealer.seal(&message::encode(&outgoing)).unwrap();
+                proto::write_frame(&mut send, &frame).await.unwrap();
+            }
+
+            let received = server_task.await.unwrap();
+            assert!(
+                matches!(received[0], message::Incoming::Accepted),
+                "acceptance must arrive before anything the peer says"
+            );
+            match &received[1] {
+                message::Incoming::Text(text) => assert_eq!(text, "first move"),
+                _ => panic!("the message sent right after accepting must still arrive"),
+            }
+            conn.close(0u32.into(), b"done");
+        })
+        .await;
+
+        outcome.expect("test timed out — iroh could not connect over loopback");
+    }
+
+    /// A peer speaking an older wire version must be turned away during the QUIC
+    /// handshake, rather than connecting and then misreading our frames. This is
+    /// what makes [`ALPN`] a usable version marker: the failure is immediate and
+    /// legible, not a confusing mid-session error.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_peer_on_a_different_wire_version_is_refused_at_dial_time() {
+        let outcome = tokio::time::timeout(Duration::from_secs(30), async {
+            // Stand in for a 0.6.x peer, which spoke `kiss-chat/0`.
+            let old = bind_local_speaking(b"kiss-chat/0").await;
+            let current = bind_local().await;
+            let old_addr = dialable_addr(&old).await;
+
+            // Keep the old peer accepting, so the refusal comes from ALPN
+            // negotiation and not from an endpoint that simply never answers.
+            tokio::spawn(async move { accept(&old).await });
+
+            assert!(
+                dial(&current, old_addr).await.is_err(),
+                "a peer on a different ALPN must not establish a connection"
+            );
+        })
+        .await;
+
+        outcome.expect("test timed out — the mismatched dial should fail promptly");
     }
 }

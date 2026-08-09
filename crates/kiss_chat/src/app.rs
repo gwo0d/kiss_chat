@@ -107,10 +107,13 @@ async fn event_loop(
     let my_id = endpoint.id();
     let mut app = App::new(my_id.to_string());
 
-    // Our own display name (optional) and whether we've accepted the current peer.
-    // We share the name only once accepted — never during the verify step.
+    // Our own display name (optional) and the two halves of mutual acceptance:
+    // whether we've accepted the current peer, and whether they've accepted us.
+    // We share the name only once *we* have accepted — never during the verify
+    // step — while chat may flow only once both are true.
     let mut my_name = display_name;
     let mut accepted = false;
+    let mut peer_accepted = false;
 
     // Bridge blocking crossterm input into async on a dedicated thread. Both key
     // presses and resizes are forwarded; a resize just wakes the loop to redraw.
@@ -177,6 +180,7 @@ async fn event_loop(
                                 accept_handle = arm_accept(&endpoint, my_id, auth_seed, &conn_tx);
                             }
                             accepted = false;
+                            peer_accepted = false;
                             app.set_connecting(peer.fmt_short().to_string());
                             spawn_dial(&endpoint, my_id, peer, auth_seed, &conn_tx);
                         }
@@ -189,6 +193,11 @@ async fn event_loop(
                         // but held back from the verify screen; surface it now.
                         let mut peer_name_to_show = None;
                         if let Some(live) = &session {
+                            // Tell the peer we've accepted, before anything else we
+                            // send: it is what opens their side of the chat, and the
+                            // stream is ordered, so it can never trail our first
+                            // message.
+                            let _ = live.outgoing_tx.send(Outgoing::Accepted);
                             // Pin (or re-pin) this peer's identity key so a future
                             // change is flagged. Accepting is the user asserting trust.
                             if let Err(err) = contacts::remember(&live.peer_id, &live.peer_identity)
@@ -223,6 +232,7 @@ async fn event_loop(
                             tokio::spawn(farewell(old.conn, old.outgoing_tx, old.writer));
                         }
                         accepted = false;
+                        peer_accepted = false;
                         accept_handle = arm_accept(&endpoint, my_id, auth_seed, &conn_tx);
                         app.set_lobby("rejected the peer — back in the lobby");
                     }
@@ -262,8 +272,10 @@ async fn event_loop(
                         // Drop any stale events left over from a previous session.
                         while net_rx.try_recv().is_ok() {}
 
-                        // Fresh channel: not yet accepted, so no name is shared.
+                        // Fresh channel: neither side has accepted yet, so no name is
+                        // shared and no chat may flow.
                         accepted = false;
+                        peer_accepted = false;
 
                         // Compare the peer's long-term identity key against any we
                         // pinned for this address when we last accepted it (TOFU), so
@@ -310,15 +322,41 @@ async fn event_loop(
             },
 
             event = net_rx.recv(), if session.is_some() => match event {
-                // Until we've accepted the peer, suppress anything they send: a
-                // well-behaved client stays silent through our verify gate, and a
-                // malicious one must not be able to paint chat text — "it's me, just
-                // accept!" — onto the very screen where the safety-word ritual matters
-                // most. A name they volunteer is still *recorded* (so it can be cached
-                // against their pin the moment we accept), but not shown.
+                // Chat text before acceptance is mutual is a protocol violation: a
+                // well-behaved peer waits for our `Accepted` before saying anything.
+                // Ending the session is both the honest reading of a peer that isn't
+                // following the protocol, and the strongest answer to a malicious one
+                // trying to paint text — "it's me, just accept!" — onto the very
+                // screen where the safety-word ritual matters most.
                 Some(NetEvent::Message(text)) => {
-                    if accepted {
+                    if accepted && peer_accepted {
                         app.push_peer(text);
+                    } else if let Some(live) = session.take() {
+                        live.reader.abort();
+                        live.writer.abort();
+                        live.conn.close(0u32.into(), b"protocol violation");
+                        accepted = false;
+                        peer_accepted = false;
+                        accept_handle = arm_accept(&endpoint, my_id, auth_seed, &conn_tx);
+                        app.set_lobby(
+                            "peer sent a message before the channel was open — disconnected",
+                        );
+                    }
+                }
+                Some(NetEvent::PeerAccepted) => {
+                    peer_accepted = true;
+                    // If this completes the mutual acceptance, the UI opens the chat
+                    // and hands back whatever the user typed while waiting, which we
+                    // send now — in the order they typed it.
+                    let held = app.mark_peer_accepted();
+                    if let Some(live) = &session {
+                        for line in held {
+                            let _ = live.outgoing_tx.send(Outgoing::Text(line));
+                        }
+                    }
+                    if !accepted {
+                        // They accepted first; our verify gate still stands.
+                        app.note_peer_accepted_first();
                     }
                 }
                 Some(NetEvent::PeerName(name)) => {
@@ -344,6 +382,7 @@ async fn event_loop(
                         live.conn.close(0u32.into(), b"bye");
                     }
                     accepted = false;
+                    peer_accepted = false;
                     accept_handle = arm_accept(&endpoint, my_id, auth_seed, &conn_tx);
                     app.set_lobby(format!("{reason} — back in the lobby"));
                 }
