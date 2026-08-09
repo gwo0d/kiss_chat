@@ -1,8 +1,8 @@
 # Implementation plan: headless mode
 
-**Status:** proposed
+**Status:** final — ready for implementation
 **Target release:** v0.7.0 (both crates)
-**Date:** 2026-08-09
+**Date:** 2026-08-09 (rev 2: accept-acknowledgement wire change brought into scope)
 
 kiss_chat today is a terminal chat for humans. This plan adds a second frontend —
 a **headless mode** — so any application (a Python chess game, a shell script, a
@@ -10,8 +10,10 @@ bot) can spawn `kiss_chat --headless` as a child process and use it as a secure,
 peer-to-peer transport for the duration of its runtime: newline-delimited JSON
 on stdin/stdout in, end-to-end post-quantum-encrypted frames over iroh out.
 
-The plan covers the design, a phased work breakdown with acceptance criteria,
-and the full release procedure (crates.io + GitHub releases) at the end.
+The plan covers the design — including one coordinated wire-protocol change,
+a protocol-level **accept acknowledgement** (§3.6) — a phased work breakdown
+with acceptance criteria, and the full release procedure (crates.io + GitHub
+releases) at the end.
 
 ---
 
@@ -29,8 +31,13 @@ and the full release procedure (crates.io + GitHub releases) at the end.
 3. **Identity isolation.** A headless instance never fights the human TUI over
    `~/.config/kiss_chat/`; embedding applications get their own identity
    directory or an ephemeral in-memory identity.
-4. The TUI's behaviour is unchanged, and the wire protocol is unchanged —
-   v0.7.0 headless interoperates with a v0.6.x TUI peer.
+4. One **coordinated, versioned wire change**: a protocol-level *accept
+   acknowledgement* (§3.6). It gives both frontends a true mutual-accept
+   rendezvous and closes a message-loss window that exists in the TUI today
+   (§2). The break is made explicit by bumping the ALPN, and the same change
+   adds unknown-frame tolerance so that *future* additive frames are not
+   breaking. Consequence: v0.7.0 does not interoperate with v0.6.x — mixed
+   versions fail cleanly at dial time.
 5. Tests, documentation (protocol spec + a Python example), and a released
    version on crates.io and GitHub releases.
 
@@ -67,6 +74,19 @@ Facts this design leans on, verified against the current tree:
 - `transport::dial` already accepts `impl Into<EndpointAddr>`, and the loopback
   tests dial via `endpoint.addr()` with direct socket addresses — the pattern
   the hermetic headless tests will reuse.
+- The in-band protocol (`message.rs`) has three one-byte tags (`0` Text, `1`
+  Bye, `2` Name); an unknown tag (or empty frame) decodes as
+  `Incoming::Malformed`, which the reader task turns into a **disconnect**. So
+  any new frame type is a breaking wire change under today's rules — motivating
+  both the ALPN bump and the unknown-frame tolerance in §3.6.
+- The TUI's pre-accept suppression **drops** inbound text, it does not queue
+  it (`event_loop`'s `NetEvent::Message` arm: `if accepted { push }`). Concretely:
+  A accepts and types "hi"; B accepts five seconds later; B never sees "hi".
+  This silent-loss window exists in the TUI today, and any app-level "hello"
+  convention over headless would race against the same rule. The accept
+  acknowledgement (§3.6) eliminates the window for both frontends.
+- The wire version marker is the ALPN constant `kiss-chat/0` in `transport.rs`;
+  iroh refuses to connect endpoints whose ALPNs don't match, at dial time.
 - Versions are workspace-shared (`0.6.1`), and `[workspace.dependencies]` pins
   `kiss_chat_core = { path = …, version = "0.6.1" }` with a comment requiring
   the pin to move in step with `[workspace.package] version` on release bumps.
@@ -105,8 +125,9 @@ Two policies, both preserving the existing trust anchors:
 1. **Delegated verification (default).** When a channel comes up, headless
    emits a `verify` event carrying the safety words, the peer's identity
    fingerprint, and the TOFU pin status (`new` / `known` / `changed`), then
-   holds the session exactly as the TUI does — suppressing inbound chat text —
-   until the controlling application answers with `accept` or `reject`. The
+   holds the session exactly as the TUI does — no chat can flow before mutual
+   accept (§3.6) — until the controlling application answers with `accept` or
+   `reject`. The
    application shows the words in *its* UI and asks its human. The ritual
    survives; only the screen it happens on moves. Accepting pins the peer via
    `contacts::remember_in`, same as the TUI.
@@ -123,8 +144,10 @@ Two policies, both preserving the existing trust anchors:
 
 Security-behaviour parity with the TUI is a requirement, specifically:
 
-- Inbound chat text is **suppressed until accepted** (the "it's me, just
-  accept!" countermeasure in `event_loop`'s `NetEvent::Message` arm).
+- Inbound chat text before mutual acceptance is a **protocol violation** under
+  the new wire rules (§3.6) and disconnects the session — a strictly stronger
+  form of the TUI's current suppress-until-accepted countermeasure against
+  "it's me, just accept!" spoofing on the verify screen.
 - A peer-shared name is recorded pre-accept but only surfaced/cached after.
 - Received names go through `message::sanitize_name` before appearing in any
   event (they already do, core-side).
@@ -176,6 +199,56 @@ Event/command enums derive `Serialize`/`Deserialize` with
 `#[serde(tag = "event", rename_all = "snake_case")]` (resp. `tag = "cmd"`), so
 the wire shape is declared in one place.
 
+### 3.6 Wire change: the accept acknowledgement (`Accepted` frame)
+
+Today, accepting is a purely local act: nothing on the wire tells the peer you
+accepted, so (a) neither side can know when the session is *mutually* open,
+and (b) a message sent after the sender's accept but before the receiver's is
+silently dropped by the suppression rule (§2) — a real loss window in the TUI
+today, and one any app-level "hello" convention over headless would inherit.
+Since 0.7.0's minor bump already licenses breaking changes under the crate's
+pre-1.0 policy, this release fixes it at the protocol level and batches the
+wire break into the same version. The change:
+
+- **New control frame `Accepted`** (`TAG_ACCEPTED = 3`, empty body) in
+  `message.rs`: `Outgoing::Accepted` / `Incoming::Accepted`. Sent exactly
+  once, at the moment of local accept — before the optional `Name` share.
+- **Mutual accept** is the new session-open condition: local accept done *and*
+  the peer's `Accepted` received. All frames ride one ordered QUIC stream, so
+  a conforming peer's `Accepted` always precedes their first `Text`; there are
+  no reordering races.
+- **Strict early-text rule:** a `Text` frame arriving before the peer's
+  `Accepted` (or before local accept) is a protocol violation → disconnect
+  with a "protocol violation" reason. Conforming peers cannot trigger it;
+  a malicious peer gains nothing it couldn't get by disconnecting itself.
+  This *replaces* the silent suppression rule with a simpler invariant.
+- **`Name` stays valid pre-mutual** (a peer that accepted first may share
+  theirs before we accept); recording/display rules are unchanged. `Bye`
+  stays valid at any point after the handshake.
+- **Unknown-frame tolerance, from this version forward:** `decode` returns a
+  new `Incoming::Unknown` for an unrecognised tag, which readers *ignore*
+  instead of disconnecting. `Malformed` is narrowed to genuinely undecodable
+  frames (e.g. an empty frame). This is the "make the most of the breaking
+  window" move: the *next* additive frame (e.g. a `Rejected` signal, §10)
+  will not require another coordinated break. Safe because every frame
+  arrives through the AEAD session — an attacker cannot inject unknown tags.
+- **ALPN bump `kiss-chat/0` → `kiss-chat/1`** in `transport.rs`. Mixed
+  0.6/0.7 pairs then fail at *dial time* with a clean connection error,
+  instead of connecting fine and dying confusingly at the accept step with
+  "received a malformed message". The ALPN is the wire version marker.
+- **No crypto changes.** The handshake, transcript, safety words, and AEAD
+  session are untouched; `Accepted` is authenticated, ordered, and
+  replay-protected by the existing session (per-direction nonce counters).
+- **TUI adoption** (this is a TUI improvement in its own right): after
+  `/accept`, the status bar shows *waiting for peer to accept…*; lines typed
+  before mutual accept are queued locally and flushed on mutual accept (no
+  more silent loss); a system line announces the peer's accept; `NetEvent`
+  gains `PeerAccepted`.
+
+Considered and deferred: a `Rejected` frame distinguishing "peer rejected
+verification" from "peer left". With unknown-frame tolerance in place it
+becomes purely *additive* later, so deferring it now costs nothing (§10).
+
 ---
 
 ## 4. The headless NDJSON protocol, v1
@@ -202,9 +275,10 @@ context) in the README and in the rustdoc of the new `headless` module.
 | `ready` | `proto` (int), `address` (64-hex iroh EndpointId), `fingerprint` (64-hex own ML-DSA fingerprint), `name` (string\|null), `direct_addrs` (array of `"ip:port"`) | Once, after the endpoint is bound. Everything an app needs to build an invitation. |
 | `connecting` | `peer` | A dial started (startup arg or `connect` command). |
 | `verify` | `peer`, `words` (12 space-separated safety words), `fingerprint` (peer's), `pin` (`"new"`\|`"known"`\|`"changed"`), `known_name` (string\|null) | Channel established and awaiting an `accept`/`reject` decision. Not emitted when `--expect` decides. |
-| `connected` | `peer`, `fingerprint` | The local side accepted (via command or `--expect` match). |
-| `peer_name` | `name` (string\|null) | Peer shared or cleared their (sanitised) display name. Post-accept only. |
-| `message` | `text` | A decrypted chat message. Post-accept only. |
+| `accepted` | `peer`, `fingerprint` | The **local** side accepted (via command or `--expect` match); the `Accepted` frame has been sent. Awaiting the peer's unless it already arrived. |
+| `connected` | `peer`, `fingerprint` | **Mutual accept** (§3.6): the peer's `Accepted` frame has been received and the local accept is done, in either order. Sending is now permitted. Follows `accepted` immediately if the peer accepted first. |
+| `peer_name` | `name` (string\|null) | Peer shared or cleared their (sanitised) display name. Emitted only after local accept (a name arriving earlier is held until then). |
+| `message` | `text` | A decrypted chat message. Only possible after `connected` — an earlier `Text` frame is a protocol violation and disconnects (§3.6). |
 | `disconnected` | `reason` | Session over (peer left, connection lost, local reject, `--expect` mismatch). The process is back in the lobby afterwards — or exiting, under `--once`. |
 | `error` | `message` | A non-fatal problem: malformed/unknown command, `send` while not connected, over-long message, invalid peer id. |
 
@@ -213,21 +287,28 @@ context) in the README and in the rustdoc of the new `headless` module.
 | Command | Fields | Meaning |
 |---|---|---|
 | `connect` | `peer` (EndpointId hex), `addrs` (optional array of `"ip:port"`) | Dial. `addrs` enables direct dialing without discovery (LAN, tests); normally omitted. If already in a session: farewell the current peer first, exactly like the TUI's `/connect`. |
-| `accept` | — | Accept the peer under verification (pin + share own name, per §3.2). |
+| `accept` | — | Accept the peer under verification: pin, send the `Accepted` frame, then share own name (§3.2, §3.6). |
 | `reject` | — | Reject and return to the lobby. |
-| `send` | `text` | Send a chat message (≤ 4096 chars, else `error`). |
+| `send` | `text` | Send a chat message (≤ 4096 chars, else `error`). Valid only after `connected` (mutual accept) — earlier `send`s get an `error` event, they are not queued. |
 | `quit` | — | Graceful farewell, then exit 0. **EOF on stdin is equivalent to `quit`.** |
 
 ### 4.4 Lifecycle and exit codes
 
 ```
-        ┌───────── lobby (accept armed) ◄────────────┐
-        │  connect cmd / PEER_ID arg    │            │ disconnected
-        ▼                               │ inbound    │ (unless --once)
-   connecting ──established──► verifying ──accept──► chatting
-        │                       │  --expect match ▲     │
-        └── dial failed ──►     │  (skips verify) │     │
-            lobby               └─reject/mismatch─┴──► lobby / exit
+                connect cmd / PEER_ID arg           inbound peer
+       lobby ─────────────────► connecting ┐      ┌─────────────┐
+         ▲                         │       │      │             │
+         │             dial failed │       ▼      ▼             │
+         │◄────────────────────────┘     verifying ◄────────────┘
+         │                                  │
+         │◄──── reject / --expect mismatch ─┤ accept cmd, or --expect match
+         │                                  ▼
+         │                           waiting-peer ··· emits `accepted`
+         │                                  │ peer's Accepted frame arrives
+         │                                  │ (state is skipped if it arrived first)
+         │                                  ▼
+         │◄──────── session ends ─────── chatting ··· emits `connected`
+                    (peer leaves, connection lost — lobby, or exit under --once)
 ```
 
 - `0` — clean exit: `quit`, stdin EOF, or (under `--once`) a session that
@@ -237,12 +318,19 @@ context) in the README and in the rustdoc of the new `headless` module.
 - `2` — refused a peer whose identity did not match `--expect` (under
   `--once`; without `--once` it's a `disconnected` event and the lobby).
 
-One deliberate gap, documented rather than papered over: `connected` reports
-the **local** accept. The wire protocol has no accept-acknowledgement frame,
-so the peer's acceptance is only observable when their first frame (a name
-share or message) arrives. Applications that need a rendezvous should
-exchange an application-level hello as their first message. (A protocol-level
-ack is future work, §10 — it changes the wire format.)
+Rendezvous semantics: `accepted` reports the local decision; `connected`
+reports the mutual one — the peer's `Accepted` frame has arrived (§3.6). When
+`connected` fires, both humans (or both `--expect` policies) have consented,
+and every subsequently sent message will be delivered; no application-level
+hello convention is needed. There is deliberately no protocol-level timeout on
+`waiting-peer`: the controlling application owns that policy (show "waiting
+for opponent…", then `reject`, `connect` elsewhere, or `quit` as it sees fit).
+
+One intentional asymmetry between the frontends: pre-mutual `send`s in
+headless are an `error` (a program has the `connected` event to key off, and
+silent queuing would hide bugs), while lines a human types in the TUI during
+`waiting-peer` are queued and flushed on mutual accept (§3.6) — a human has no
+event stream, and dropping their words was the very bug this change removes.
 
 ### 4.5 Example session (chess app's view)
 
@@ -252,6 +340,7 @@ ack is future work, §10 — it changes the wire format.)
 ← {"event":"connecting","peer":"b1c2…88ef"}
 ← {"event":"verify","peer":"b1c2…88ef","words":"vault sketch tide …","fingerprint":"77aa…","pin":"new","known_name":null}
 → {"cmd":"accept"}
+← {"event":"accepted","peer":"b1c2…88ef","fingerprint":"77aa…"}
 ← {"event":"connected","peer":"b1c2…88ef","fingerprint":"77aa…"}
 → {"cmd":"send","text":"{\"move\":\"e2e4\"}"}
 ← {"event":"message","text":"{\"move\":\"e7e5\"}"}
@@ -304,7 +393,29 @@ from `app.rs`:
 --workspace --all-targets`, and a manual TUI smoke test (lobby, dial, accept,
 chat, quit) all behave exactly as before.
 
-### Phase 2 — the headless event loop and NDJSON codec
+### Phase 2 — the wire change: accept acknowledgement
+
+Implements §3.6. Sequenced after the extraction so the frontend half lands in
+one place (`net.rs` + the TUI loop), and before the headless work so headless
+is built against the final semantics from day one. This phase is independently
+valuable: it fixes the TUI's accept-window message loss on its own.
+
+| Change | File | Notes |
+|---|---|---|
+| `TAG_ACCEPTED = 3`; `Outgoing::Accepted` / `Incoming::Accepted` | `message.rs` (core) | Empty body. Round-trip tests. |
+| `Incoming::Unknown` for unrecognised tags; `Malformed` narrowed to undecodable frames | `message.rs` (core) | Tests: unknown tag is ignored by readers; an empty frame is still malformed. |
+| ALPN `kiss-chat/0` → `kiss-chat/1` | `transport.rs` (core) | The constant is the wire version marker; update the module docs to say so. |
+| `NetEvent::PeerAccepted`; the reader task maps `Incoming::Accepted` to it and silently skips `Unknown` | `net.rs` | |
+| Mutual-accept state in the TUI loop: send `Accepted` (then `Name`) on `/accept`; early-`Text` violation → disconnect; queue lines typed during waiting-peer and flush on mutual accept; status bar shows *waiting for peer to accept…*; system line on `PeerAccepted` | `app.rs`, `ui.rs` | The queue is a plain `Vec<String>`, discarded on reject/disconnect. |
+
+**Acceptance:** core round-trip and tolerance tests green; `ui.rs`
+state-machine unit tests cover both accept orderings (we-first, they-first)
+and queue-flush; a loopback integration test proves the §2 loss window is
+gone (A accepts and sends, B accepts later, B still receives); dialing across
+mismatched ALPNs fails cleanly at connect time (two in-process endpoints, old
+vs new ALPN); manual two-TUI smoke test of the full accept flow.
+
+### Phase 3 — the headless event loop and NDJSON codec
 
 New module `crates/kiss_chat/src/headless.rs`:
 
@@ -319,22 +430,24 @@ New module `crates/kiss_chat/src/headless.rs`:
   stdio** so tests inject `tokio::io::duplex` pipes. Structure mirrors
   `app::event_loop`: a `tokio::select!` over parsed input lines, `ConnResult`s,
   and `NetEvent`s, with the same state machine (lobby / connecting / verifying
-  / chatting), the same pre-accept suppression, the same pin/name logic on
-  accept, and the same farewell paths — minus rendering, plus `Event`
-  emission.
+  / waiting-peer / chatting), the same mutual-accept and early-text-violation
+  rules from §3.6, the same pin/name logic on accept, and the same farewell
+  paths — minus rendering, plus `Event` emission.
 - Ephemeral mode: contacts reads/writes are skipped (pin status constant
   `new`); nothing is persisted.
 - `--expect`: on `ConnResult::Established`, compare
   `contacts::fingerprint(session.peer_identity())` against the allowed set
-  and short-circuit the verifying state per §3.2.
+  and short-circuit the verifying state per §3.2 — a match auto-accepts
+  (emitting `accepted` at once, then `connected` when the peer's `Accepted`
+  arrives), a mismatch disconnects.
 - `main.rs` grows `mod headless;` and tokio features `io-std`, `io-util` in
   `crates/kiss_chat/Cargo.toml`; stdin is bridged with
   `BufReader::new(tokio::io::stdin()).lines()`.
 
 **Acceptance:** unit tests for the codec; the loop compiles against duplex
-pipes (exercised properly in Phase 4).
+pipes (exercised properly in Phase 5).
 
-### Phase 3 — CLI parsing
+### Phase 4 — CLI parsing
 
 Replace the `args().nth(1)` match in `main.rs` with a small hand-rolled
 parser producing `enum Invocation { Tui { config_dir, peer }, Headless(HeadlessOpts), Help, Version }`.
@@ -350,9 +463,9 @@ parser producing `enum Invocation { Tui { config_dir, peer }, Headless(HeadlessO
 **Acceptance:** table-driven unit tests for the parser (valid combinations,
 each rejection path, flag order independence).
 
-### Phase 4 — tests
+### Phase 5 — tests
 
-1. **Codec + parser units** (Phases 2–3, in-module).
+1. **Codec + parser units** (Phases 3–4, in-module).
 2. **Hermetic full-stack integration test**
    (`crates/kiss_chat/tests/headless_loopback.rs`): bind two
    discovery-free loopback endpoints (the `presets::Minimal` +
@@ -360,12 +473,17 @@ each rejection path, flag order independence).
    `endpoint.addr()`), run two `headless::event_loop`s over duplex pipes, and
    script the whole conversation: both `ready` events → `connect` with
    `addrs` → both `verify` events with **identical safety words** → both
-   `accept` → `connected` → message round-trip in both directions →
-   `quit` → the peer sees `disconnected` with the peer-left reason.
-   Variants: `--expect` match (no `verify`, straight to `connected`),
-   `--expect` mismatch (`disconnected` + exit path 2), `reject`, `--once`
-   exit, pre-accept message suppression (a message sealed before accept is
-   never emitted as an event until after).
+   `accept` → each side emits `accepted` then `connected` → message
+   round-trip in both directions → `quit` → the peer sees `disconnected`
+   with the peer-left reason. Run the accept step in both orderings (A first,
+   B first) and assert `connected` fires on both sides in both cases — the
+   loss-window regression test at the headless level.
+   Variants: `--expect` match (no `verify`; `accepted` immediately,
+   `connected` on the peer's ack), `--expect` mismatch (`disconnected` + exit
+   path 2), `reject`, `--once` exit, pre-mutual `send` → `error` event, and
+   the early-text violation (a hand-rolled test peer that seals a `Text`
+   frame before its `Accepted` gets disconnected with the protocol-violation
+   reason).
 3. **Identity isolation test:** two ephemeral instances produce distinct
    addresses; a `--config-dir` instance reuses its keys across restarts and
    pins survive to produce `pin:"known"` on reconnect.
@@ -383,13 +501,16 @@ rustdoc, audit) pick the new code up via `--workspace`.
 
 **Acceptance:** all of the above green on the three CI OSes.
 
-### Phase 5 — documentation and example
+### Phase 6 — documentation and example
 
 - **README:** new *Headless mode* section — motivation, invocation, the §4
   protocol tables, the identity-isolation rule, an invitation convention
   ("share `address` and `fingerprint` from `ready` with your opponent"), and
-  the Python snippet below. Update the usage block and in-app tables' intro
-  to mention the second frontend.
+  a short Python usage snippet. Update the usage block and in-app tables'
+  intro to mention the second frontend. Update the accept flow description
+  ("waiting for peer to accept…"), the `message` row of the module table
+  (chat text vs. `Bye`/`Accepted` control frames), and add a compatibility
+  note: 0.7.x peers cannot connect to 0.6.x peers (ALPN `kiss-chat/1`).
 - **rustdoc:** module docs for `headless` (the spec's normative copy for Rust
   readers), `net`, and the promoted core items; `crates/kiss_chat_core/README.md`
   gets one line noting the second in-tree consumer.
@@ -411,11 +532,17 @@ demo runs against a locally built binary on Linux and macOS.
 1. **PR 1 — groundwork (no behaviour change):** Phases 0 + 1. Easy review:
    core diff is visibility promotions + `bind_with`; frontend diff is a code
    move. CI green proves the TUI is untouched.
-2. **PR 2 — headless mode:** Phases 2 + 3 + 4. The feature, its CLI, and its
+2. **PR 2 — the wire change:** Phase 2. Self-contained and independently
+   valuable (fixes the TUI's accept-window message loss); reviewable against
+   §3.6 alone. This is the only PR that touches the wire format.
+3. **PR 3 — headless mode:** Phases 3 + 4 + 5. The feature, its CLI, and its
    tests, reviewable against the §4 spec.
-3. **PR 3 — docs + example:** Phase 5. Optionally folded into PR 2.
+4. **PR 4 — docs + example:** Phase 6. Optionally folded into PR 3.
 
-Then the release (§7) from `main`.
+Then the release (§7) from `main`. Note the deployment coupling: once PR 2
+merges, a `main` build no longer talks to v0.6.x — fine for development, but
+it means there is no useful partial release; ship v0.7.0 only when all PRs
+have landed.
 
 ---
 
@@ -423,21 +550,28 @@ Then the release (§7) from `main`.
 
 ### 7.1 Version reasoning
 
-- `kiss_chat_core` 0.6.1 → **0.7.0**: additive API, but pre-1.0 the crate's
-  own policy is "expect breaking changes between minor versions", and a minor
-  bump is the honest signal for new public surface.
-- `kiss_chat` 0.6.1 → **0.7.0**: new feature; versions are workspace-shared
-  anyway (`[workspace.package] version`).
-- **Wire compatibility:** ALPN (`kiss-chat/0`), the handshake, and the framed
-  message protocol are untouched — a 0.7.0 headless client interoperates with
-  a 0.6.x TUI. Say so in the release notes.
+- `kiss_chat_core` 0.6.1 → **0.7.0**: breaking, and the minor bump signals it
+  per the crate's pre-1.0 policy ("expect breaking changes between minor
+  versions"). Breaking in two ways: new variants on the public
+  `Incoming`/`Outgoing` enums (breaks downstream exhaustive matches —
+  deliberate: frontends *should* be forced to decide how to handle `Accepted`
+  and `Unknown`, so no `#[non_exhaustive]`), and the wire semantics of §3.6.
+  Plus the additive API from Phase 0.
+- `kiss_chat` 0.6.1 → **0.7.0**: new headless feature + the accept-flow
+  change; versions are workspace-shared anyway (`[workspace.package] version`).
+- **Wire compatibility: broken, deliberately and visibly.** The ALPN moves to
+  `kiss-chat/1`, so 0.7.0 and 0.6.x peers fail cleanly at dial time — both
+  sides must upgrade. The handshake and crypto are untouched. From 0.7.0
+  onward, unknown-frame tolerance (§3.6) makes future *additive* frames
+  compatible within the `kiss-chat/1` era. Lead the release notes with this.
 - The **NDJSON protocol** starts at `proto: 1`, versioned independently of
   the crate version (§4.1).
 
 ### 7.2 Pre-release checklist (on `main`, after the PRs merge)
 
 1. CI fully green on `main`, including the weekly-audit-sensitive `audit` job.
-2. The manual long-idle soak (Phase 4.5) done, with any keepalive fix landed.
+2. The manual long-idle soak (Phase 5, item 5) done, with any keepalive fix
+   landed.
 3. Release commit ("release: v0.7.0"), touching exactly:
    - `[workspace.package] version` → `0.7.0`;
    - `[workspace.dependencies] kiss_chat_core.version` → `0.7.0` (the
@@ -480,13 +614,21 @@ targets (x86_64/aarch64 Linux gnu, x86_64 musl, both macOS, Windows MSVC).
 
 Release-notes skeleton:
 
+- **⚠ Breaking (wire):** the new accept acknowledgement and ALPN
+  `kiss-chat/1` mean 0.7.x peers cannot connect to 0.6.x peers — the dial
+  fails cleanly; upgrade both sides. (Lead with this bullet.)
+- **Accept acknowledgement** — accepting now tells your peer: the TUI shows
+  *waiting for peer to accept…*, opens chat only once both sides have
+  accepted, and no longer silently loses messages sent before the peer's
+  accept.
 - **Headless mode** — spawn `kiss_chat --headless` from any language; NDJSON
   protocol v1 on stdio (link the README section); `--config-dir`,
   `--ephemeral`, `--expect`, `--name`, `--once`.
-- **`kiss_chat_core` additions** — path-parameterised identity/contacts APIs,
-  `transport::bind_with`, public `contacts::fingerprint`.
-- **Compatibility** — wire protocol unchanged; interoperates with 0.6.x. TUI
-  behaviour unchanged. MSRV 1.91.
+- **`kiss_chat_core` changes** — new `Accepted`/`Unknown` frames (breaking
+  for exhaustive matches), unknown-frame tolerance, path-parameterised
+  identity/contacts APIs, `transport::bind_with`, public
+  `contacts::fingerprint`.
+- **Compatibility** — handshake and crypto unchanged; MSRV 1.91.
 - Checksums note (as released binaries already carry).
 
 ### 7.5 Post-release verification
@@ -511,6 +653,9 @@ Release-notes skeleton:
   installs).
 - A protocol-spec bug found post-release → additive fixes ride 0.7.x with
   `proto` still 1; a breaking fix bumps `proto` to 2 and the crate to 0.8.0.
+- A *wire*-protocol bug found post-release → additive frames now ride 0.7.x
+  (unknown-frame tolerance means old 0.7.x peers ignore them); a semantic
+  break bumps the ALPN to `kiss-chat/2` and the crate to 0.8.0.
 
 ---
 
@@ -520,8 +665,16 @@ Release-notes skeleton:
   embedding app's UI) or **replaced by an equivalent out-of-band check**
   (`--expect`, where the invitation channel carrying address+fingerprint is
   the anchor). Auto-accept-everything is deliberately not offered.
-- Pre-accept inbound text stays suppressed in headless — the countermeasure
-  matters *more* when a program relays the verify screen.
+- Pre-accept inbound text is now a protocol violation that disconnects (§3.6)
+  — a strictly stronger countermeasure than the old silent suppression, and
+  it matters *more* when a program relays the verify screen.
+- The `Accepted` frame rides inside the AEAD session: authenticated, ordered
+  (single QUIC stream), and replay-protected by the per-direction nonce
+  counters — a network attacker can neither forge a peer's acceptance nor
+  reorder it after their chat text.
+- Unknown-frame tolerance does not create an injection surface: unknown tags
+  can only arrive through the AEAD session, i.e. from the authenticated peer,
+  and they are dropped without side effects.
 - Pins live per config dir, so an application's TOFU state is isolated from
   the human's; `--ephemeral` never trusts silently (everything is `new`).
 - The existing caveat that a local attacker can rewrite `contacts` applies
@@ -536,17 +689,21 @@ Release-notes skeleton:
 
 | Risk | Mitigation |
 |---|---|
-| QUIC idle timeout kills long-think sessions (chess!) | Phase 4.5 soak test before release; endpoint keepalive config in `transport` if needed. |
+| QUIC idle timeout kills long-think sessions (chess!) | Phase 5 (item 5) soak test before release; endpoint keepalive config in `transport` if needed. |
 | serde_json dependency growth in the binary crate | Accepted: correctness of JSON escaping beats hand-rolling; core stays serde-free. |
 | Parent never reads stdout → child stalls | By design (backpressure); documented for integrators. |
 | Windows stdio quirks (CRLF, EOF signalling) | Tolerant input framing (§4.1); binary smoke test runs on the Windows CI leg. |
-| No peer-accept ack in the wire protocol | Documented gap + app-level hello convention (§4.4); protocol-level ack is future work. |
+| Mixed 0.6/0.7 peers stranded mid-upgrade | ALPN bump makes it a clean dial-time failure, not a confusing mid-session error; release notes lead with the upgrade requirement; the user base is small and self-updating. |
+| Accept state-machine regressions in the TUI | `ui.rs` stays a pure state machine with unit tests over both accept orderings; the loopback integration test pins the no-loss behaviour. |
 | Two processes sharing one identity dir | Hard-refused in headless (§3.3); README warns for the TUI. |
 
 ## 10. Future work (explicitly out of scope)
 
-- A protocol-level *accepted* control frame (new message tag — a coordinated
-  wire change, since unknown tags currently read as `Malformed` and disconnect).
+- A `Rejected` control frame, so a peer whose verification failed sees
+  "peer rejected the connection" rather than "peer left" (useful when safety
+  words genuinely mismatch). Thanks to §3.6's unknown-frame tolerance this is
+  now purely *additive* — an old 0.7.x peer simply ignores it — so it can ride
+  any later release without another coordinated break.
 - A documented offline/LAN mode (`--offline`) promoting the test-only direct
   dialing path to a user feature — no relay/discovery infrastructure at all.
 - PyO3 / N-API bindings to `kiss_chat_core` for in-process embedding.
