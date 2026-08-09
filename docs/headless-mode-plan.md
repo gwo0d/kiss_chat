@@ -1,8 +1,28 @@
 # Implementation plan: headless mode
 
-**Status:** final — ready for implementation
+**Status:** implemented — §1–6 done and green; release (§7) outstanding
 **Target release:** v0.7.0 (both crates)
 **Date:** 2026-08-09 (rev 2: accept-acknowledgement wire change brought into scope)
+
+> **Implementation notes.** Phases 0–6 landed as five commits on
+> `claude/kiss-chat-backend-design-ybnioi`. Three things went differently from
+> the plan, all forced by facts discovered while building:
+>
+> 1. **The loopback tests live in `src/headless.rs`, not `tests/`.** `kiss_chat`
+>    is a binary-only crate, so an integration test in `tests/` cannot call into
+>    its modules at all. The full-stack scenarios (§5, Phase 5 item 2) are unit
+>    tests in the module instead, which is where they can drive `event_loop`
+>    directly; `tests/headless_binary.rs` covers what only an external test can —
+>    the *process* contract of stdio, exit codes, and EOF.
+> 2. **`--config-dir` for the TUI needed threading, not just a flag.** Every
+>    `contacts`/`identity` call site in `app.rs` moved to its `_in(dir)` variant.
+> 3. **The QUIC idle-timeout risk (§9) resolved itself.** iroh 1.0.1 already sets
+>    a 5s keepalive against a 15s path idle timeout, so no keepalive
+>    configuration was needed; verified empirically by a 5-minute idle soak
+>    (20× the timeout) with messages flowing in both directions afterwards.
+>
+> The deferred `Rejected` frame (§10) remains deferred, and is now purely
+> additive thanks to the unknown-frame tolerance that shipped with it.
 
 kiss_chat today is a terminal chat for humans. This plan adds a second frontend —
 a **headless mode** — so any application (a Python chess game, a shell script, a
