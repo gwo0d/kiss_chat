@@ -65,6 +65,11 @@ Every [release](https://github.com/gwo0d/kiss_chat/releases/latest) also ships p
 for Linux, macOS, and Windows (each with a SHA-256 checksum) — download, extract, and run, no
 toolchain required.
 
+Linux gets four builds: x86-64 and arm64, each in a glibc (`*-linux-gnu`) and a statically linked
+musl (`*-linux-musl`) flavour. Pick musl if the glibc build complains about the libc version, or
+for minimal containers and distros without glibc (Alpine and friends) — it has no runtime libc
+dependency at all.
+
 **macOS: the binaries are not code-signed.** If you download one through a browser, Gatekeeper
 will refuse to open it ("Apple could not verify … is free of malware"), because it is neither
 signed with an Apple Developer ID nor notarised. Clear the quarantine flag once and it runs

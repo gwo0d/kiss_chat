@@ -36,6 +36,8 @@ jobs:
           # Statically linked (musl) — runs on any Linux without a libc match.
           - target: x86_64-unknown-linux-musl
             os: ubuntu-latest
+          - target: aarch64-unknown-linux-musl
+            os: ubuntu-latest
           - target: aarch64-apple-darwin
             os: macos-latest
           # Cross-compiled from the Apple-Silicon runner (the macOS toolchain is

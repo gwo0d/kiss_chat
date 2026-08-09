@@ -2034,7 +2034,7 @@ dependencies = [
 
 [[package]]
 name = "kiss_chat"
-version = "0.7.1"
+version = "0.7.2"
 dependencies = [
  "anyhow",
  "crossterm",
@@ -2049,7 +2049,7 @@ dependencies = [
 
 [[package]]
 name = "kiss_chat_core"
-version = "0.7.1"
+version = "0.7.2"
 dependencies = [
  "anyhow",
  "bech32",
