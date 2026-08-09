@@ -1,14 +1,20 @@
 //! Terminal UI state: a scrolling history above a single input line.
 //!
 //! This module is pure state + rendering + key interpretation. It never touches
-//! crypto or the network — the main loop drives it, feeding in [`NetEvent`]s and
-//! acting on the [`Action`]s that key presses produce.
+//! crypto or the network — the main loop drives it, feeding in
+//! [`NetEvent`](crate::net::NetEvent)s and acting on the [`Action`]s that key
+//! presses produce.
 //!
 //! The input line is a command prompt (`/connect`, `/help`, `/quit`) until a peer
 //! is connected. When a channel comes up the app holds it in a **verify** gate: a
 //! first-seen (or changed-key) peer must have their safety words compared out-of-band,
 //! while a peer you've verified before is simply *recognised* and asked only for a
 //! quick `/accept`. Either way nothing is sent until the user `/accept`s (or `/reject`s).
+//!
+//! Accepting doesn't open the chat on its own, because the peer has their own gate
+//! to pass: the app then **waits** for their acceptance, and only once both sides
+//! have accepted does chat begin. Lines typed while waiting aren't lost — they're
+//! held and sent the moment the peer accepts.
 //!
 //! Timestamps shown next to messages are in UTC.
 
@@ -30,16 +36,6 @@ const SCROLL_STEP: usize = 5;
 /// The crate version, shown in the frame title and reported by `/version`.
 const VERSION: &str = env!("CARGO_PKG_VERSION");
 
-/// An event flowing from the network tasks into the UI.
-pub enum NetEvent {
-    /// A decrypted message from the peer.
-    Message(String),
-    /// The peer shared (or, with `None`, cleared) their display name.
-    PeerName(Option<String>),
-    /// The session ended; carries a human-readable reason.
-    Disconnected(String),
-}
-
 /// What a key press asked for, interpreted by the main loop.
 pub enum Action {
     /// Nothing for the main loop to do.
@@ -60,11 +56,15 @@ pub enum Action {
     ListContacts,
 }
 
-#[derive(Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Mode {
     Lobby,
     Connecting,
     Verifying,
+    /// We have accepted; the peer hasn't yet (or their acceptance hasn't arrived).
+    /// Typing is allowed here — lines are held and sent the moment chat opens — but
+    /// nothing may be sent or received until acceptance is mutual.
+    WaitingPeer,
     Connected,
 }
 
@@ -111,6 +111,12 @@ pub struct App {
     recognized: bool,
     /// The peer's chosen display name, once they share it (only after accepting).
     peer_name: Option<String>,
+    /// Whether the peer has accepted the channel. Chat opens only when this and our
+    /// own acceptance have both happened — in whichever order they occur.
+    peer_accepted: bool,
+    /// Lines typed while waiting for the peer to accept, held so they can be sent
+    /// the moment chat opens instead of being silently dropped.
+    pending_lines: Vec<String>,
     /// Our own address, kept so `/address` can recall it after `/clear`.
     my_address: String,
     pub should_quit: bool,
@@ -131,6 +137,8 @@ impl App {
             safety_number: String::new(),
             recognized: false,
             peer_name: None,
+            peer_accepted: false,
+            pending_lines: Vec::new(),
             my_address: my_address.clone(),
             should_quit: false,
         };
@@ -203,6 +211,10 @@ impl App {
         self.peer_short = peer_short;
         self.safety_number = safety_number.clone();
         self.recognized = pin == PinStatus::Known;
+        // A fresh channel: the peer's acceptance and anything typed at the last one
+        // belong to a session that is over.
+        self.peer_accepted = false;
+        self.pending_lines.clear();
         // Default to no name. A name cached under a *different* (New/Changed) identity
         // must never be shown as if it belonged to this peer; the recognised branch
         // below restores it, since there the cached name *is* this same identity's.
@@ -261,8 +273,38 @@ impl App {
         self.push_system("  /reject   any word differs — disconnect");
     }
 
-    /// Transition from verifying to an active chat once the user accepts.
-    fn mark_connected(&mut self) {
+    /// Record the user's acceptance, opening the chat if the peer has already
+    /// accepted too and otherwise waiting for them.
+    fn mark_accepted(&mut self) {
+        if self.peer_accepted {
+            self.open_chat();
+        } else {
+            self.mode = Mode::WaitingPeer;
+            self.status = format!("waiting for {} to accept…", self.peer_short);
+            self.push_system(
+                "accepted — waiting for the peer to accept too. Anything you type now",
+            );
+            self.push_system("is held and sent as soon as they do.");
+        }
+    }
+
+    /// Record that the peer accepted the channel.
+    ///
+    /// Returns the lines typed while we were waiting, which the caller sends now
+    /// that chat is open — empty unless this completed the mutual acceptance.
+    pub fn mark_peer_accepted(&mut self) -> Vec<String> {
+        self.peer_accepted = true;
+        if self.mode != Mode::WaitingPeer {
+            // They accepted before we did; the verify gate still stands, and
+            // `mark_accepted` will open the chat when the user says yes.
+            return Vec::new();
+        }
+        self.open_chat();
+        std::mem::take(&mut self.pending_lines)
+    }
+
+    /// Both sides have accepted: open the chat.
+    fn open_chat(&mut self) {
         self.mode = Mode::Connected;
         self.status = self.connected_status();
         let note = if self.recognized {
@@ -271,6 +313,13 @@ impl App {
             "verified — type a message and press Enter; /quit to leave."
         };
         self.push_system(note);
+        if !self.pending_lines.is_empty() {
+            let held = self.pending_lines.len();
+            let label = if held == 1 { "message" } else { "messages" };
+            self.push_system(format!(
+                "sending the {held} {label} you typed while waiting"
+            ));
+        }
     }
 
     /// The status-bar text for an active chat, folding in the peer's name if known.
@@ -299,6 +348,12 @@ impl App {
         }
     }
 
+    /// Note that the peer accepted before we did, so the verify prompt doesn't look
+    /// like it is waiting on them.
+    pub fn note_peer_accepted_first(&mut self) {
+        self.push_system("the peer has accepted — this connection is waiting on you.");
+    }
+
     /// Return to the lobby (fresh start, or after a peer disconnects / dial fails).
     pub fn set_lobby(&mut self, note: impl Into<String>) {
         self.mode = Mode::Lobby;
@@ -306,6 +361,14 @@ impl App {
         self.peer_short.clear();
         self.safety_number.clear();
         self.peer_name = None;
+        self.peer_accepted = false;
+        // Anything still held was meant for a session that never opened.
+        if !self.pending_lines.is_empty() {
+            let held = self.pending_lines.len();
+            let label = if held == 1 { "message" } else { "messages" };
+            self.pending_lines.clear();
+            self.push_system(format!("{held} unsent {label} discarded"));
+        }
         self.push_system(note);
     }
 
@@ -461,7 +524,7 @@ impl App {
             }
         }
         match self.mode {
-            Mode::Connected => {
+            Mode::Connected | Mode::WaitingPeer => {
                 // Cap the length before echoing or sending: an over-long line would
                 // otherwise be a frame the peer rejects, tearing down their session.
                 let len = line.chars().count();
@@ -473,6 +536,12 @@ impl App {
                     return Action::None;
                 }
                 self.push(Author::You, line.clone());
+                if self.mode == Mode::WaitingPeer {
+                    // Chat isn't open yet: hold the line rather than dropping it,
+                    // and send it the moment the peer accepts.
+                    self.pending_lines.push(line);
+                    return Action::None;
+                }
                 Action::Send(line)
             }
             Mode::Verifying => {
@@ -501,6 +570,8 @@ impl App {
                 Some(id) if matches!(self.mode, Mode::Lobby | Mode::Connected) => {
                     Action::Connect(id.to_string())
                 }
+                // Mid-verify or waiting on the peer: there's a pending decision or a
+                // half-open channel, so finish (or /reject) it before dialling out.
                 Some(_) => {
                     self.push_system("finish the current connection first");
                     Action::None
@@ -512,9 +583,9 @@ impl App {
             },
             "accept" | "a" => {
                 if self.mode == Mode::Verifying {
-                    self.mark_connected();
-                    // The main loop shares our display name (if any) now that we've
-                    // accepted — never before.
+                    self.mark_accepted();
+                    // The main loop announces our acceptance to the peer and shares
+                    // our display name (if any) now — never before.
                     Action::Accept
                 } else {
                     self.push_system("nothing to accept right now");
@@ -531,8 +602,10 @@ impl App {
                     .unwrap_or_default();
                 Action::SetName(raw)
             }
+            // Also allowed while waiting on the peer: having accepted shouldn't trap
+            // the user in a half-open channel if the peer never answers.
             "reject" | "r" => {
-                if self.mode == Mode::Verifying {
+                if matches!(self.mode, Mode::Verifying | Mode::WaitingPeer) {
                     Action::RejectPeer
                 } else {
                     self.push_system("nothing to reject right now");
@@ -645,6 +718,7 @@ impl App {
         // Input line: prompt reflects whether we're chatting, verifying, or commanding.
         let (label, color) = match self.mode {
             Mode::Connected => ("message", Color::Blue),
+            Mode::WaitingPeer => ("waiting for peer to accept — type to queue", Color::Yellow),
             Mode::Verifying if self.recognized => {
                 ("accept connection? /accept or /reject", Color::Yellow)
             }
@@ -870,10 +944,11 @@ mod tests {
         app.on_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::empty()))
     }
 
-    // Drive the app into an accepted, connected session.
+    // Drive the app into an open chat: both sides accept (us first).
     fn reach_connected(app: &mut App) {
         app.set_verifying("peer".into(), "ab-cd".into(), PinStatus::New, None);
         let _ = submit_line(app, "/accept");
+        let _ = app.mark_peer_accepted();
     }
 
     #[test]
@@ -966,6 +1041,100 @@ mod tests {
         reach_connected(&mut app);
         let at_cap = "a".repeat(message::MAX_MESSAGE_CHARS);
         assert!(matches!(submit_line(&mut app, &at_cap), Action::Send(_)));
+    }
+
+    #[test]
+    fn accepting_waits_for_the_peer_before_opening_chat() {
+        // Our /accept alone must not open the chat: the peer hasn't accepted yet,
+        // so anything sent now could not be shown by them.
+        let mut app = App::new("my-addr".into());
+        app.set_verifying("peer".into(), "ab-cd".into(), PinStatus::New, None);
+        let _ = submit_line(&mut app, "/accept");
+        assert_eq!(app.mode, Mode::WaitingPeer);
+        assert!(app.status.contains("waiting"));
+
+        // Their acceptance opens it.
+        let _ = app.mark_peer_accepted();
+        assert_eq!(app.mode, Mode::Connected);
+    }
+
+    #[test]
+    fn a_peer_accepting_first_opens_chat_on_our_accept() {
+        // The other ordering: they accept while we're still verifying, so our
+        // /accept completes the mutual acceptance and opens chat immediately.
+        let mut app = App::new("my-addr".into());
+        app.set_verifying("peer".into(), "ab-cd".into(), PinStatus::New, None);
+        let flushed = app.mark_peer_accepted();
+        assert!(
+            flushed.is_empty(),
+            "nothing can be queued before we've accepted"
+        );
+        // Their acceptance must not bypass our verify gate.
+        assert_eq!(app.mode, Mode::Verifying);
+
+        let _ = submit_line(&mut app, "/accept");
+        assert_eq!(app.mode, Mode::Connected);
+    }
+
+    #[test]
+    fn lines_typed_while_waiting_are_held_and_flushed_in_order() {
+        // The message-loss window this release closes: text typed after our accept
+        // but before the peer's must reach them, not vanish.
+        let mut app = App::new("my-addr".into());
+        app.set_verifying("peer".into(), "ab-cd".into(), PinStatus::New, None);
+        let _ = submit_line(&mut app, "/accept");
+
+        assert!(matches!(submit_line(&mut app, "first"), Action::None));
+        assert!(matches!(submit_line(&mut app, "second"), Action::None));
+        // The user sees their own lines immediately, even though they're held.
+        assert!(
+            app.history
+                .iter()
+                .any(|l| matches!(l.author, Author::You) && l.text == "first")
+        );
+
+        assert_eq!(app.mark_peer_accepted(), vec!["first", "second"]);
+        // Flushing empties the queue, so a later event can't resend them.
+        assert!(app.mark_peer_accepted().is_empty());
+    }
+
+    #[test]
+    fn held_lines_are_discarded_when_the_channel_never_opens() {
+        let mut app = App::new("my-addr".into());
+        app.set_verifying("peer".into(), "ab-cd".into(), PinStatus::New, None);
+        let _ = submit_line(&mut app, "/accept");
+        let _ = submit_line(&mut app, "held");
+
+        app.set_lobby("peer left");
+        assert!(app.pending_lines.is_empty());
+        // And a fresh session can't inherit the previous peer's acceptance.
+        app.set_verifying("other".into(), "ef-gh".into(), PinStatus::New, None);
+        assert!(!app.peer_accepted);
+    }
+
+    #[test]
+    fn an_over_long_message_is_refused_while_waiting_too() {
+        let mut app = App::new("my-addr".into());
+        app.set_verifying("peer".into(), "ab-cd".into(), PinStatus::New, None);
+        let _ = submit_line(&mut app, "/accept");
+        let long = "a".repeat(message::MAX_MESSAGE_CHARS + 1);
+        assert!(matches!(submit_line(&mut app, &long), Action::None));
+        assert!(
+            app.pending_lines.is_empty(),
+            "an over-long line must not be queued either"
+        );
+    }
+
+    #[test]
+    fn reject_is_allowed_while_waiting_on_the_peer() {
+        // Having accepted must not trap the user in a half-open channel.
+        let mut app = App::new("my-addr".into());
+        app.set_verifying("peer".into(), "ab-cd".into(), PinStatus::New, None);
+        let _ = submit_line(&mut app, "/accept");
+        assert!(matches!(
+            submit_line(&mut app, "/reject"),
+            Action::RejectPeer
+        ));
     }
 
     #[test]

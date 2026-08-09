@@ -35,6 +35,9 @@ handful of small Rust modules — simplicity of both architecture and code is th
 - **Tiny and readable.** A handful of small, focused modules. Nothing clever you have to
   reverse-engineer.
 - **Terminal UI.** Scrolling history with word-wrap, timestamps, scrollback, and line editing.
+- **Embeddable.** [`--headless`](#headless-mode) turns kiss_chat into a secure transport your own
+  programs can drive: spawn it, speak newline-delimited JSON on stdio, and get the same
+  end-to-end encrypted channel — in any language, with no library to link.
 
 ## Requirements
 
@@ -108,6 +111,10 @@ cargo run -- 96aedec725a0104933cfd73a2722b3497b13307100a242ccb47efe9cb1fafa39
 Pass `--version` (or `-v`) to print the version and exit; `--help` (or `-h`) prints usage. Inside
 the app, `/version` (alias `/v`) shows the same version, which also appears in the frame title.
 
+`--config-dir <path>` keeps this session's identity, contacts, and display name somewhere other
+than the default directory — handy for a second identity, or for running two instances on one
+machine.
+
 Your keys live in `$XDG_CONFIG_HOME/kiss_chat/` (falling back to `~/.config/kiss_chat/`),
 owner-readable only: `secret.key` is your iroh address and `auth.key` is your ML-DSA
 authentication seed. Delete them to rotate to a fresh identity; copy them to run as the same
@@ -121,6 +128,11 @@ When a channel comes up, kiss_chat pauses before chat and shows a short phrase o
 derived from the whole handshake — both peers' identities *and* the session's fresh ephemeral keys —
 the same phrase on both ends. Read it aloud with your peer over a trusted channel (say it aloud, a
 phone call, etc.), then `/accept` if every word matches in order or `/reject` if any differs.
+
+Your peer has the same decision to make, so accepting shows **waiting for peer to accept…** until
+they do; chat opens when both of you have accepted. Anything you type while waiting is held and
+sent the moment they accept, so nothing you say goes missing in the gap. (`/reject` still works
+while waiting, if they never answer.)
 Verifying once is enough: the ML-DSA signatures in the handshake bind the session to that identity,
 so a man-in-the-middle would show a *different* phrase. Because the words also cover the ephemeral
 keys, they can't be precomputed offline, and `/safety` re-shows them at any time.
@@ -196,6 +208,125 @@ When you leave — by quitting, or by `/connect`-ing to someone else — kiss_ch
 goodbye so they see a clean "peer left the chat" notice rather than a stalled connection. Either
 side dropping returns you to the lobby, where you can `/connect` to someone new.
 
+## Headless mode
+
+kiss_chat can be driven by a program instead of a person. `--headless` runs the same protocol
+with no terminal: it writes one JSON object per line to stdout (events) and reads one per line
+from stdin (commands). Spawn it as a child process and you have a secure, peer-to-peer,
+post-quantum-encrypted channel for as long as your application runs — in any language, with no
+library to link against.
+
+The motivating case: two people running a small program — a chess game, a shared whiteboard —
+who want to talk directly, without you standing up a server for them.
+
+```bash
+kiss_chat --headless --ephemeral                 # throwaway identity, nothing written to disk
+kiss_chat --headless --config-dir ~/.myapp/kc    # stable identity kept in that directory
+```
+
+One of the two is required. kiss_chat will **not** fall back to your own config directory: that
+would bind a second endpoint claiming your address, and mix an application's trusted peers in
+with yours.
+
+Other flags: `--expect <fingerprint>` (repeatable — see [Unattended use](#unattended-use)),
+`--name <text>` (a display name for this run, not saved), `--once` (exit when the first session
+ends — the natural fit for "one game, one process"), and a bare peer address to dial on startup.
+
+### Events (stdout)
+
+| Event | Fields | When |
+|-------|--------|------|
+| `ready` | `proto`, `address`, `fingerprint`, `name`, `direct_addrs` | Once, after binding. Everything you need to build an invitation. (`direct_addrs` is a best-effort convenience for dialling without discovery, and may be empty this early — the `address` is what peers actually need.) |
+| `connecting` | `peer` | A dial started. |
+| `verify` | `peer`, `words`, `fingerprint`, `pin`, `known_name` | A channel is up, awaiting your accept/reject. `pin` is `new`, `known`, or `changed`. |
+| `accepted` | `peer`, `fingerprint` | *You* accepted; the peer has been told. |
+| `connected` | `peer`, `fingerprint` | Both sides have accepted. You may send now. |
+| `peer_name` | `name` | The peer shared or cleared their display name. |
+| `message` | `text` | A decrypted chat message. |
+| `disconnected` | `reason` | The session ended. |
+| `error` | `message` | A command was rejected; the session carries on. |
+
+### Commands (stdin)
+
+| Command | Fields | Meaning |
+|---------|--------|---------|
+| `connect` | `peer`, `addrs` (optional) | Dial a peer. `addrs` are explicit `ip:port` addresses, to skip discovery. |
+| `accept` | — | Accept the peer being verified. |
+| `reject` | — | Reject the peer being verified. |
+| `send` | `text` | Send a message. Only valid after `connected`. |
+| `quit` | — | Say goodbye and exit. Closing stdin does the same. |
+
+Exit codes: `0` clean, `1` startup or (with `--once`) a dial that never connected, `2` a peer
+whose identity `--expect` disallowed.
+
+**Ignore what you don't recognise.** Unknown events, and unknown fields on the ones you do know,
+are how this protocol grows without breaking you. `ready` carries `proto` (currently `1`), which
+changes only if a conforming consumer would break.
+
+### A session, end to end
+
+```jsonl
+← {"event":"ready","proto":1,"address":"96aede…","fingerprint":"3c9a…","name":null,"direct_addrs":["192.168.1.7:52400"]}
+→ {"cmd":"connect","peer":"b1c2…"}
+← {"event":"connecting","peer":"b1c2…"}
+← {"event":"verify","peer":"b1c2…","words":"vault sketch tide …","fingerprint":"77aa…","pin":"new","known_name":null}
+→ {"cmd":"accept"}
+← {"event":"accepted","peer":"b1c2…","fingerprint":"77aa…"}
+← {"event":"connected","peer":"b1c2…","fingerprint":"77aa…"}
+→ {"cmd":"send","text":"{\"move\":\"e2e4\"}"}
+← {"event":"message","text":"{\"move\":\"e7e5\"}"}
+→ {"cmd":"quit"}
+```
+
+`accepted` is your decision; `connected` is *both* — the peer has accepted too, and anything you
+send from then on will reach them. Wait for `connected` before sending; there's no timeout on it,
+so how long to wait (and whether to offer a "give up" button) is your application's call.
+
+### Verifying, from a program
+
+The safety-word ritual isn't skipped here, it moves: the `verify` event hands you the words, the
+peer's fingerprint, and whether you've met before, and *your* interface shows them to *your* user.
+Read the words aloud together, then send `accept` or `reject`. This is what the security of the
+channel rests on — a man-in-the-middle produces different words on the two ends.
+
+### Unattended use
+
+For two programs meeting with no human present, `--expect <fingerprint>` pre-pins the identity
+the peer must present: a match is accepted automatically, anything else is refused. This is
+sound because you already have to send the address out of band — put the fingerprint from `ready`
+in the same invitation, and the out-of-band check simply happens *before* the connection instead
+of after it.
+
+There is deliberately no "accept anything" mode.
+
+### From Python
+
+[`examples/python/`](examples/python) has a ~150-line stdlib-only wrapper (`kiss_pipe.py`) and a
+two-terminal demo chat (`demo_chat.py`):
+
+```python
+from kiss_pipe import KissChat
+
+with KissChat(ephemeral=True) as chat:
+    print("invite your opponent with:", chat.address, chat.fingerprint)
+    chat.connect(opponent_address)
+
+    verify = chat.wait_for("verify")
+    show_to_user(verify["words"])          # compare these aloud
+    chat.accept()                          # ...once they match
+    chat.wait_for("connected")             # both sides are in
+
+    chat.send_json({"move": "e2e4"})
+    reply = chat.wait_for("message")
+```
+
+Treat what arrives as untrusted input: kiss_chat authenticates, decrypts, and strips control
+characters, but what a message *means* is your application's business — validate it as you would
+anything off a socket.
+
+If your application is itself in Rust, you don't need any of this: depend on
+[`kiss_chat_core`](crates/kiss_chat_core) directly.
+
 ## How it works
 
 ```
@@ -219,15 +350,18 @@ interface — and [`kiss_chat`](crates/kiss_chat), the terminal frontend that co
 | `contacts` | pinned contact list: remembers each accepted peer's ML-DSA key (TOFU) |
 | `transport` | iroh endpoint: bind, dial-by-key, accept (QUIC + NAT traversal) |
 | `proto` | length-prefixed framing over the stream |
-| `message` | 1-byte-tagged in-band protocol (chat text vs. a `Bye` control frame) |
+| `message` | 1-byte-tagged in-band protocol (chat text vs. `Accepted`/`Bye`/`Name` control frames) |
 | `crypto` | hybrid KEX, ML-DSA authentication, key derivation, ChaCha20-Poly1305 session |
 
 **`kiss_chat`:**
 
 | Module | Responsibility |
 |--------|----------------|
+| `net` | the connection driver both frontends share: dial/accept, handshake, reader/writer tasks |
 | `ui` | terminal interface (pure state machine) |
-| `app` | the event loop wiring input, connection tasks, and the UI together |
+| `app` | the terminal event loop wiring input, connection tasks, and the UI together |
+| `headless` | the machine-driven frontend: NDJSON events and commands on stdio |
+| `cli` | argument parsing |
 
 ### The handshake, briefly
 
@@ -247,6 +381,16 @@ as `ikm = ml_kem_secret || x25519_secret` and run through HKDF-SHA256, salted wi
 classical secret is *hybrid* key exchange (the 2026 industry default): the session stays
 confidential as long as **either** primitive holds. Each message is then sealed with
 ChaCha20-Poly1305 using deterministic, per-direction nonce counters.
+
+Once the channel is up, each side sends an `Accepted` frame when its user accepts, and chat opens
+only when both have — so neither end can be talking to a screen that is still asking "do you trust
+this person?". Chat text arriving before that is treated as a protocol violation and ends the
+session. Frames tagged with something a version doesn't recognise are ignored rather than fatal,
+so later additions don't need a coordinated break.
+
+> **Compatibility.** The wire protocol is versioned by the QUIC ALPN, `kiss-chat/1` since 0.7.0
+> (it was `kiss-chat/0` up to 0.6.x). Peers on different wire versions are refused when dialling,
+> with a plain connection error — so both sides need to be on 0.7 or newer to talk.
 
 The **safety words** are a short fingerprint of the whole transcript — both identity keys, both
 ephemeral keys, and both iroh EndpointIds — rendered as a 12-word phrase (BIP39 wordlist) and
@@ -283,9 +427,13 @@ cargo clippy --workspace --all-targets
 ```
 
 The integration tests spin up two real iroh endpoints on loopback and run a complete
-connect → three-message authenticated handshake → encrypted round-trip.
+connect → three-message authenticated handshake → encrypted round-trip. The headless tests go
+further, driving two whole instances through verification, mutual acceptance, and a message
+exchange over in-memory pipes — the full stack, minus the process boundary, with no network
+involved. A separate suite checks the built binary's process contract (stdio, exit codes, EOF).
 
 ## Not (yet) included
 
 Group chat, message history on disk, file transfer, and local-time timestamps. The architecture
-leaves room for each without a rewrite.
+leaves room for each without a rewrite. Headless mode is one peer at a time, like the rest of
+kiss_chat, so it suits two-player applications; anything multi-party needs group chat first.

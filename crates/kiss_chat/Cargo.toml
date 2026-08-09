@@ -18,4 +18,17 @@ anyhow.workspace = true
 crossterm.workspace = true
 iroh.workspace = true
 ratatui.workspace = true
-tokio = { workspace = true, features = ["rt-multi-thread", "macros", "sync", "time"] }
+serde.workspace = true
+serde_json.workspace = true
+tokio = { workspace = true, features = [
+    "rt-multi-thread",
+    "macros",
+    "sync",
+    "time",
+    "io-std",
+    "io-util",
+] }
+
+[dev-dependencies]
+# The binary smoke tests parse the process's JSON output.
+serde_json.workspace = true

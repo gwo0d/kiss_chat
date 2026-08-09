@@ -17,11 +17,12 @@ interface:
 | `contacts` | pinned contact list: remembers each peer's ML-DSA key (TOFU) |
 | `transport` | iroh: bind, dial-by-key, accept (handles NAT traversal) |
 | `proto` | length-prefixed framing over the QUIC stream |
-| `message` | the one-byte-tagged in-band protocol (chat text vs. `Bye` control) |
+| `message` | the one-byte-tagged in-band protocol (chat text vs. `Accepted`/`Bye`/`Name` control frames) |
 | `crypto` | hybrid X25519 + ML-KEM-1024 KEX, ML-DSA-87 auth, ChaCha20-Poly1305 |
 
-The [`kiss_chat`](https://crates.io/crates/kiss_chat) crate — the terminal
-frontend — is its first consumer. See the [project
+The [`kiss_chat`](https://crates.io/crates/kiss_chat) crate is its consumer,
+providing two frontends on these same modules: the terminal UI, and a headless
+mode that lets other programs drive a session over stdio. See the [project
 README](https://github.com/gwo0d/kiss_chat#readme) for what kiss_chat is, its
 threat model, and how to use it.
 
