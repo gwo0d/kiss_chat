@@ -17,6 +17,19 @@
 //! stored world-readable (it's not a secret), and only ever shared with a peer
 //! after a channel is accepted.
 //!
+//! # Choosing where the keys live
+//!
+//! Every function here comes in two forms: a zero-argument one using the user's
+//! own config directory ([`config_dir`]), and an `_in(dir)` one taking the
+//! directory explicitly. The latter exists for frontends that must **not** share
+//! the user's identity — notably an embedded/headless instance driven by another
+//! application, which would otherwise bind a second endpoint with the same
+//! [`EndpointId`] as the user's interactive session.
+//!
+//! For an identity that never touches disk at all, generate the two secrets
+//! directly ([`iroh::SecretKey::generate`] and [`random_auth_seed`]) and pass
+//! them to [`crate::transport::bind_with`] and [`crate::crypto::SigningIdentity`].
+//!
 //! [`EndpointId`]: iroh::EndpointId
 
 use std::path::{Path, PathBuf};
@@ -38,9 +51,20 @@ const DISPLAY_NAME_FILE: &str = "name";
 /// Fails if the config directory can't be located or created, or if an existing
 /// `secret.key` can't be read or is malformed.
 pub fn load_or_create_endpoint_secret() -> Result<SecretKey> {
-    let bytes = load_or_create_key(&config_dir()?, ENDPOINT_KEY_FILE, || {
-        SecretKey::generate().to_bytes()
-    })?;
+    load_or_create_endpoint_secret_in(&config_dir()?)
+}
+
+/// Load the persistent iroh endpoint key from `dir`, creating one on first run.
+///
+/// The explicit-directory form of [`load_or_create_endpoint_secret`], for
+/// frontends that keep their identity outside the user's config directory.
+///
+/// # Errors
+///
+/// Fails if `dir` can't be created, or if an existing `secret.key` can't be read
+/// or is malformed.
+pub fn load_or_create_endpoint_secret_in(dir: &Path) -> Result<SecretKey> {
+    let bytes = load_or_create_key(dir, ENDPOINT_KEY_FILE, || SecretKey::generate().to_bytes())?;
     Ok(SecretKey::from_bytes(&bytes))
 }
 
@@ -51,11 +75,36 @@ pub fn load_or_create_endpoint_secret() -> Result<SecretKey> {
 /// Fails if the config directory can't be located or created, or if an existing
 /// `auth.key` can't be read or is malformed.
 pub fn load_or_create_auth_seed() -> Result<[u8; 32]> {
-    load_or_create_key(&config_dir()?, AUTH_SEED_FILE, random_seed)
+    load_or_create_auth_seed_in(&config_dir()?)
 }
 
-/// A fresh 32-byte seed drawn straight from the operating system CSPRNG.
-fn random_seed() -> [u8; 32] {
+/// Load the persistent 32-byte ML-DSA authentication seed from `dir`, creating one
+/// on first run.
+///
+/// The explicit-directory form of [`load_or_create_auth_seed`], for frontends that
+/// keep their identity outside the user's config directory.
+///
+/// # Errors
+///
+/// Fails if `dir` can't be created, or if an existing `auth.key` can't be read or
+/// is malformed.
+pub fn load_or_create_auth_seed_in(dir: &Path) -> Result<[u8; 32]> {
+    load_or_create_key(dir, AUTH_SEED_FILE, random_auth_seed)
+}
+
+/// A fresh 32-byte ML-DSA authentication seed drawn straight from the operating
+/// system CSPRNG.
+///
+/// Use this for an *ephemeral* identity — one generated per run and never
+/// persisted — feeding it to [`crate::crypto::SigningIdentity::from_seed`]. The
+/// persistent counterpart is [`load_or_create_auth_seed`].
+///
+/// # Panics
+///
+/// Panics if the operating system CSPRNG is unavailable, which would leave us
+/// unable to generate keys at all.
+#[must_use]
+pub fn random_auth_seed() -> [u8; 32] {
     let mut seed = [0u8; 32];
     getrandom::fill(&mut seed).expect("operating system CSPRNG must be available");
     seed
@@ -74,18 +123,14 @@ pub fn load_display_name() -> Result<Option<String>> {
     load_display_name_in(&config_dir()?)
 }
 
-/// Persist (or, with `None`, remove) the display name.
+/// Read the display name from `dir`, treating a missing file as "unset".
+///
+/// The explicit-directory form of [`load_display_name`].
 ///
 /// # Errors
 ///
-/// Fails if the config directory can't be located or created, or the `name` file
-/// can't be written or removed.
-pub fn save_display_name(name: Option<&str>) -> Result<()> {
-    save_display_name_in(&config_dir()?, name)
-}
-
-/// Read the display name from `dir`, treating a missing file as "unset".
-fn load_display_name_in(dir: &Path) -> Result<Option<String>> {
+/// Fails if the `name` file exists but can't be read.
+pub fn load_display_name_in(dir: &Path) -> Result<Option<String>> {
     let path = dir.join(DISPLAY_NAME_FILE);
     match std::fs::read_to_string(&path) {
         Ok(contents) => {
@@ -99,8 +144,24 @@ fn load_display_name_in(dir: &Path) -> Result<Option<String>> {
     }
 }
 
+/// Persist (or, with `None`, remove) the display name.
+///
+/// # Errors
+///
+/// Fails if the config directory can't be located or created, or the `name` file
+/// can't be written or removed.
+pub fn save_display_name(name: Option<&str>) -> Result<()> {
+    save_display_name_in(&config_dir()?, name)
+}
+
 /// Write the display name into `dir`, or delete the file when clearing it.
-fn save_display_name_in(dir: &Path, name: Option<&str>) -> Result<()> {
+///
+/// The explicit-directory form of [`save_display_name`].
+///
+/// # Errors
+///
+/// Fails if `dir` can't be created, or the `name` file can't be written or removed.
+pub fn save_display_name_in(dir: &Path, name: Option<&str>) -> Result<()> {
     let path = dir.join(DISPLAY_NAME_FILE);
     match name {
         Some(name) => {
@@ -143,7 +204,15 @@ fn load_or_create_key(
 
 /// The directory holding kiss_chat's keys: `$XDG_CONFIG_HOME/kiss_chat`, or
 /// `$HOME/.config/kiss_chat` when `XDG_CONFIG_HOME` is unset.
-pub(crate) fn config_dir() -> Result<PathBuf> {
+///
+/// This is the directory the zero-argument functions in this module use. Frontends
+/// can call it to *report* where the user's identity lives, and pass a different
+/// path to the `_in` variants to keep an identity elsewhere.
+///
+/// # Errors
+///
+/// Fails if neither `XDG_CONFIG_HOME` nor `HOME` is set.
+pub fn config_dir() -> Result<PathBuf> {
     let base = if let Some(xdg) = std::env::var_os("XDG_CONFIG_HOME") {
         PathBuf::from(xdg)
     } else {

@@ -13,7 +13,7 @@
 
 use anyhow::{Context, Result};
 use iroh::endpoint::{Connection, RecvStream, SendStream, presets};
-use iroh::{Endpoint, EndpointAddr};
+use iroh::{Endpoint, EndpointAddr, SecretKey};
 
 use crate::identity;
 
@@ -33,7 +33,21 @@ pub const ALPN: &[u8] = b"kiss-chat/0";
 ///
 /// [`EndpointId`]: iroh::EndpointId
 pub async fn bind() -> Result<Endpoint> {
-    let secret_key = identity::load_or_create_endpoint_secret()?;
+    bind_with(identity::load_or_create_endpoint_secret()?).await
+}
+
+/// Bind an endpoint with an explicitly supplied secret key, otherwise identical
+/// to [`bind`].
+///
+/// Use this when the identity does not come from the user's own config directory:
+/// a frontend keeping its keys elsewhere (see
+/// [`identity::load_or_create_endpoint_secret_in`]), or an ephemeral identity
+/// generated per run with [`SecretKey::generate`] and never persisted.
+///
+/// # Errors
+///
+/// Fails if the endpoint can't bind a socket.
+pub async fn bind_with(secret_key: SecretKey) -> Result<Endpoint> {
     Endpoint::builder(presets::N0)
         .secret_key(secret_key)
         .alpns(vec![ALPN.to_vec()])

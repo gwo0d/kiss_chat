@@ -88,6 +88,22 @@ pub fn recognize(address: &str, identity_key: &[u8]) -> Result<Recognition> {
     recognize_in(&config_dir()?, address, identity_key)
 }
 
+/// Look a connecting peer up in the contact list held in `dir`.
+///
+/// The explicit-directory form of [`recognize`], for frontends that keep their
+/// contacts outside the user's config directory.
+///
+/// # Errors
+///
+/// Fails if the contacts file exists but can't be read.
+pub fn recognize_in(dir: &Path, address: &str, identity_key: &[u8]) -> Result<Recognition> {
+    let contacts = load(dir)?;
+    Ok(Recognition {
+        status: status_in(&contacts, address, identity_key),
+        name: contacts.get(address).and_then(|c| c.name.clone()),
+    })
+}
+
 /// Pin (or re-pin) a peer's identity key against their iroh address.
 ///
 /// Called when the user `/accept`s a peer: it records the presented key as the
@@ -103,38 +119,15 @@ pub fn remember(address: &str, identity_key: &[u8]) -> Result<()> {
     remember_in(&config_dir()?, address, identity_key)
 }
 
-/// Cache (or, with `None`, clear) the display name for an already-pinned peer.
+/// Pin (or re-pin) a peer's identity key in the contact list held in `dir`.
 ///
-/// A no-op if the address isn't in the contact list — we only remember names for
-/// peers we've accepted — and it only rewrites the file when the name changes.
-///
-/// # Errors
-///
-/// Fails if the contacts file can't be read or (when the name changes) written.
-pub fn set_name(address: &str, name: Option<&str>) -> Result<()> {
-    set_name_in(&config_dir()?, address, name)
-}
-
-/// The peers we've accepted before, for `/contacts`: named peers first
-/// (case-insensitive alphabetical), then unnamed ones by address.
+/// The explicit-directory form of [`remember`].
 ///
 /// # Errors
 ///
-/// Fails if the config directory can't be located or the contacts file exists but
-/// can't be read.
-pub fn known_peers() -> Result<Vec<KnownPeer>> {
-    known_peers_in(&config_dir()?)
-}
-
-fn recognize_in(dir: &Path, address: &str, identity_key: &[u8]) -> Result<Recognition> {
-    let contacts = load(dir)?;
-    Ok(Recognition {
-        status: status_in(&contacts, address, identity_key),
-        name: contacts.get(address).and_then(|c| c.name.clone()),
-    })
-}
-
-fn remember_in(dir: &Path, address: &str, identity_key: &[u8]) -> Result<()> {
+/// Fails if the contacts file can't be read, or `dir` can't be created or the
+/// file written.
+pub fn remember_in(dir: &Path, address: &str, identity_key: &[u8]) -> Result<()> {
     let mut contacts = load(dir)?;
     let fingerprint = fingerprint(identity_key);
     let entry = contacts
@@ -150,7 +143,26 @@ fn remember_in(dir: &Path, address: &str, identity_key: &[u8]) -> Result<()> {
     save(dir, &contacts)
 }
 
-fn set_name_in(dir: &Path, address: &str, name: Option<&str>) -> Result<()> {
+/// Cache (or, with `None`, clear) the display name for an already-pinned peer.
+///
+/// A no-op if the address isn't in the contact list — we only remember names for
+/// peers we've accepted — and it only rewrites the file when the name changes.
+///
+/// # Errors
+///
+/// Fails if the contacts file can't be read or (when the name changes) written.
+pub fn set_name(address: &str, name: Option<&str>) -> Result<()> {
+    set_name_in(&config_dir()?, address, name)
+}
+
+/// Cache (or, with `None`, clear) the display name for a peer pinned in `dir`.
+///
+/// The explicit-directory form of [`set_name`].
+///
+/// # Errors
+///
+/// Fails if the contacts file can't be read or (when the name changes) written.
+pub fn set_name_in(dir: &Path, address: &str, name: Option<&str>) -> Result<()> {
     let mut contacts = load(dir)?;
     if let Some(entry) = contacts.get_mut(address) {
         let cleaned = name.and_then(sanitize_name);
@@ -162,7 +174,25 @@ fn set_name_in(dir: &Path, address: &str, name: Option<&str>) -> Result<()> {
     Ok(())
 }
 
-fn known_peers_in(dir: &Path) -> Result<Vec<KnownPeer>> {
+/// The peers we've accepted before, for `/contacts`: named peers first
+/// (case-insensitive alphabetical), then unnamed ones by address.
+///
+/// # Errors
+///
+/// Fails if the config directory can't be located or the contacts file exists but
+/// can't be read.
+pub fn known_peers() -> Result<Vec<KnownPeer>> {
+    known_peers_in(&config_dir()?)
+}
+
+/// The peers accepted before, from the contact list held in `dir`.
+///
+/// The explicit-directory form of [`known_peers`].
+///
+/// # Errors
+///
+/// Fails if the contacts file exists but can't be read.
+pub fn known_peers_in(dir: &Path) -> Result<Vec<KnownPeer>> {
     let mut peers: Vec<KnownPeer> = load(dir)?
         .into_iter()
         .map(|(address, contact)| KnownPeer {
@@ -182,8 +212,17 @@ fn known_peers_in(dir: &Path) -> Result<Vec<KnownPeer>> {
     Ok(peers)
 }
 
-/// The SHA-256 fingerprint (lowercase hex) of an encoded ML-DSA verifying key.
-fn fingerprint(identity_key: &[u8]) -> String {
+/// The SHA-256 fingerprint (lowercase hex, 64 characters) of an encoded ML-DSA
+/// verifying key — as returned by [`crate::crypto::Session::peer_identity`].
+///
+/// This is *the* short form of a kiss_chat identity: it is what the contact list
+/// pins, and what a frontend shows (or compares) when it needs to name an identity
+/// without carrying the multi-kilobyte key itself. An out-of-band invitation that
+/// pairs an address with this fingerprint lets a peer be authenticated without the
+/// interactive safety-word comparison — the invitation channel becomes the trust
+/// anchor instead.
+#[must_use]
+pub fn fingerprint(identity_key: &[u8]) -> String {
     use std::fmt::Write;
     Sha256::digest(identity_key)
         .iter()
