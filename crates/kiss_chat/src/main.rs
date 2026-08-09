@@ -25,7 +25,7 @@
 //! | `/accept`, `/reject` | accept or reject a peer after comparing the safety words |
 //! | `/safety` | re-show the current session's safety words |
 //! | `/contacts` | list the peers you've accepted before |
-//! | `/address [words]` | show your own address to share (`words` for the 24-word form) |
+//! | `/address [words\|hex]` | show your own address to share — `kiss1…` by default |
 //! | `/qr` | show your own address as a QR code |
 //! | `/name [text]` | set your (optional) display name; only shared after `/accept` |
 //! | `/clear` | clear the screen |

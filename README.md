@@ -114,16 +114,16 @@ cargo run -- kiss1j6hda3e95qgyjv706uazwg4nf9a3xvr3qz3y9n950mlfev06lgusyhfk3x
 An address is a full 256-bit public key, so it can't be made shorter — but it can be made
 friendlier. kiss_chat shows and accepts the same address in three interchangeable forms:
 
-- **`kiss1…`** — the form to copy/paste. Its charset avoids look-alike characters and it ends in
-  a checksum, so a mistyped character is caught when it's entered rather than dialling into the
-  void. Shown grouped for readability; the grouping (and any line-wrapping a terminal adds) is
-  fine to include when copying.
+- **`kiss1…`** (`/address`) — the default, and the form to copy/paste. Its charset avoids
+  look-alike characters and it ends in a checksum, so a mistyped character is caught when it's
+  entered rather than dialling into the void. Shown grouped for readability; the grouping (and any
+  line-wrapping a terminal adds) is fine to include when copying.
 - **24 words** (`/address words`) — the form to read over a phone call or write on paper, drawn
   from the BIP39 wordlist with its standard checksum, so a wrong, missing, or swapped word is
   caught too. *These are your public address, not safety words — never compare them to verify a
   peer.*
-- **plain hex** (shown under `/address`) — the canonical form, and the one to give a peer running
-  an older kiss_chat version.
+- **plain hex** (`/address hex`) — the canonical form, and the one to give a peer running an older
+  kiss_chat version.
 
 `/qr` renders the address as a QR code right in the terminal, for pointing a phone at.
 
@@ -203,7 +203,7 @@ The input line doubles as a command prompt:
 | `/name [text]` | set your optional display name; empty clears it (alias `/n`) |
 | `/safety` | re-show the current session's safety words (alias `/s`) |
 | `/contacts` | list the peers you've accepted before (alias `/peers`) |
-| `/address [words]` | show your own address to share — `kiss1…` and hex, or the 24-word form (alias `/addr`) |
+| `/address [words\|hex]` | show your own address to share: `kiss1…` by default, `words` to read aloud, `hex` for older peers (alias `/addr`) |
 | `/qr` | show your own address as a QR code |
 | `/clear` | clear the screen |
 | `/version` | show the version (alias `/v`) |

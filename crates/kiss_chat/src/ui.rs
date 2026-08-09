@@ -676,19 +676,29 @@ impl App {
                     Action::None
                 }
             }
+            // Bare `/address` shows only the form worth sharing: one address, one
+            // block, nothing to pick between. The other forms are a word away for
+            // whoever needs them — reading aloud, or a peer on an older version.
             "address" | "addr" => {
-                if arg == Some("words") {
-                    self.push_address_words();
-                } else {
-                    self.push_system("your address — the kiss1… form is the one to share:");
-                    let bech32 = grouped_bech32(&self.my_address.bech32);
-                    self.push(Author::Address, bech32);
-                    self.push_system("as plain hex, for peers on older kiss_chat versions:");
-                    let hex = self.my_address.hex.clone();
-                    self.push(Author::Address, hex);
-                    self.push_system(
-                        "also shareable as words (/address words) or as a QR code (/qr)",
-                    );
+                match arg {
+                    None => {
+                        self.push_system("your address:");
+                        let bech32 = grouped_bech32(&self.my_address.bech32);
+                        self.push(Author::Address, bech32);
+                        self.push_system(
+                            "also: /address words (to read aloud) · /address hex (older peers) · /qr",
+                        );
+                    }
+                    Some("words") => self.push_address_words(),
+                    Some("hex") => {
+                        self.push_system("your address as plain hex, for peers on older versions:");
+                        let hex = self.my_address.hex.clone();
+                        self.push(Author::Address, hex);
+                    }
+                    Some(other) => {
+                        self.push_system(format!("unknown address form: {other}"));
+                        self.push_system("usage: /address [words|hex]");
+                    }
                 }
                 Action::None
             }
@@ -743,7 +753,9 @@ impl App {
                 );
                 self.push_system("  /safety              re-show the current safety words");
                 self.push_system("  /contacts            list the peers you've accepted before");
-                self.push_system("  /address [words]     show your own address to share");
+                self.push_system(
+                    "  /address [words|hex] show your own address to share (kiss1… by default)",
+                );
                 self.push_system("  /qr                  show your own address as a QR code");
                 self.push_system("  /clear               clear the screen");
                 self.push_system("  /version             show the version (alias /v)");
@@ -1587,7 +1599,10 @@ mod tests {
         let _ = submit_line(&mut app, "/clear");
         assert!(app.history.is_empty());
         assert!(matches!(submit_line(&mut app, "/address"), Action::None));
-        assert!(app.history.iter().any(|line| line.text.contains("my-addr")));
+        assert_eq!(address_blocks(&app), vec!["kiss1 test form"]);
+        // Every other form survives the clear too.
+        let _ = submit_line(&mut app, "/address hex");
+        assert!(address_blocks(&app).contains(&"my-addr"));
     }
 
     #[test]
@@ -1739,25 +1754,59 @@ mod tests {
         assert!(blob.contains("1 alpha"), "words should be numbered");
     }
 
-    #[test]
-    fn address_command_shows_both_string_forms() {
-        let mut app = App::new(test_address());
-        let _ = submit_line(&mut app, "/clear");
-        assert!(matches!(submit_line(&mut app, "/address"), Action::None));
-        let addresses: Vec<&str> = app
-            .history
+    // The address blocks pushed since the history was last cleared.
+    fn address_blocks(app: &App) -> Vec<&str> {
+        app.history
             .iter()
             .filter(|l| matches!(l.author, Author::Address))
             .map(|l| l.text.as_str())
-            .collect();
+            .collect()
+    }
+
+    #[test]
+    fn address_shows_only_the_shareable_form() {
+        // One address, one block: the legacy hex would only be a second thing to
+        // choose between, so it lives behind /address hex.
+        let mut app = App::new(test_address());
+        let _ = submit_line(&mut app, "/clear");
+        assert!(matches!(submit_line(&mut app, "/address"), Action::None));
+        assert_eq!(address_blocks(&app), vec!["kiss1 test form"]);
+    }
+
+    #[test]
+    fn address_hex_shows_the_legacy_form() {
+        let mut app = App::new(test_address());
+        let _ = submit_line(&mut app, "/clear");
+        assert!(matches!(
+            submit_line(&mut app, "/address hex"),
+            Action::None
+        ));
+        assert_eq!(address_blocks(&app), vec!["my-addr"]);
+    }
+
+    #[test]
+    fn an_unknown_address_form_is_reported_not_guessed() {
+        let mut app = App::new(test_address());
+        let _ = submit_line(&mut app, "/clear");
+        assert!(matches!(
+            submit_line(&mut app, "/address hexx"),
+            Action::None
+        ));
         assert!(
-            addresses.iter().any(|t| t.starts_with("kiss1")),
-            "missing the kiss1… form: {addresses:?}"
+            address_blocks(&app).is_empty(),
+            "a typo must not silently show some other form"
         );
         assert!(
-            addresses.contains(&"my-addr"),
-            "missing the legacy hex form: {addresses:?}"
+            app.history
+                .iter()
+                .any(|l| l.text.contains("usage: /address"))
         );
+    }
+
+    #[test]
+    fn the_lobby_greeting_shows_only_the_shareable_form() {
+        let app = App::new(test_address());
+        assert_eq!(address_blocks(&app), vec!["kiss1 test form"]);
     }
 
     #[test]
