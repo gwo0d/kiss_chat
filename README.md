@@ -97,16 +97,39 @@ cargo run
 ```
 
 ```
--- your address: 96aedec725a0104933cfd73a2722b3497b13307100a242ccb47efe9cb1fafa39
+-- your address:
+  kiss1 j6hd a3e9 5qgy jv70 6uaz wg4n f9a3 xvr3 qz3y 9n95 0mlf ev06 lgus yhfk 3x
 -- share it so a peer can dial you, or connect out with:
---   /connect <peer-id>
+--   /connect <address>
 ```
 
-**Or dial immediately** with the address your peer shared:
+**Or dial immediately** with the address your peer shared, in whichever form they shared it:
 
 ```bash
-cargo run -- 96aedec725a0104933cfd73a2722b3497b13307100a242ccb47efe9cb1fafa39
+cargo run -- kiss1j6hda3e95qgyjv706uazwg4nf9a3xvr3qz3y9n950mlfev06lgusyhfk3x
 ```
+
+### Sharing your address
+
+An address is a full 256-bit public key, so it can't be made shorter — but it can be made
+friendlier. kiss_chat shows and accepts the same address in three interchangeable forms:
+
+- **`kiss1…`** — the form to copy/paste. Its charset avoids look-alike characters and it ends in
+  a checksum, so a mistyped character is caught when it's entered rather than dialling into the
+  void. Shown grouped for readability; the grouping (and any line-wrapping a terminal adds) is
+  fine to include when copying.
+- **24 words** (`/address words`) — the form to read over a phone call or write on paper, drawn
+  from the BIP39 wordlist with its standard checksum, so a wrong, missing, or swapped word is
+  caught too. *These are your public address, not safety words — never compare them to verify a
+  peer.*
+- **plain hex** (shown under `/address`) — the canonical form, and the one to give a peer running
+  an older kiss_chat version.
+
+`/qr` renders the address as a QR code right in the terminal, for pointing a phone at.
+
+Every place an address is entered — `/connect`, the command line, headless `connect` — takes any
+form, and forgives what terminals do to them: line breaks, indentation, grouping spaces, and even
+stray TUI border characters picked up by a copy are stripped before decoding.
 
 Pass `--version` (or `-v`) to print the version and exit; `--help` (or `-h`) prints usage. Inside
 the app, `/version` (alias `/v`) shows the same version, which also appears in the frame title.
@@ -174,13 +197,14 @@ The input line doubles as a command prompt:
 
 | Command | Action |
 |---------|--------|
-| `/connect <peer-id>` | dial a peer; if already connected, leaves that peer and switches (alias `/c`) |
+| `/connect <address>` | dial a peer (any address form); if already connected, leaves that peer and switches (alias `/c`) |
 | `/accept` | accept the peer — after every safety word matches, or just to consent to a recognised one (alias `/a`) |
 | `/reject` | reject the peer being verified and return to the lobby (alias `/r`) |
 | `/name [text]` | set your optional display name; empty clears it (alias `/n`) |
 | `/safety` | re-show the current session's safety words (alias `/s`) |
 | `/contacts` | list the peers you've accepted before (alias `/peers`) |
-| `/address` | show your own address to share (alias `/addr`) |
+| `/address [words]` | show your own address to share — `kiss1…` and hex, or the 24-word form (alias `/addr`) |
+| `/qr` | show your own address as a QR code |
 | `/clear` | clear the screen |
 | `/version` | show the version (alias `/v`) |
 | `/help` | list commands (alias `/h`, `/?`) |
@@ -236,7 +260,7 @@ ends — the natural fit for "one game, one process"), and a bare peer address t
 
 | Event | Fields | When |
 |-------|--------|------|
-| `ready` | `proto`, `address`, `fingerprint`, `name`, `direct_addrs` | Once, after binding. Everything you need to build an invitation. (`direct_addrs` is a best-effort convenience for dialling without discovery, and may be empty this early — the `address` is what peers actually need.) |
+| `ready` | `proto`, `address`, `address_bech32`, `address_words`, `fingerprint`, `name`, `direct_addrs` | Once, after binding. Everything you need to build an invitation. `address` is the canonical hex; `address_bech32` (`kiss1…`) and `address_words` (24 words) are the same address for handing to humans. (`direct_addrs` is a best-effort convenience for dialling without discovery, and may be empty this early — the `address` is what peers actually need.) |
 | `connecting` | `peer` | A dial started. |
 | `verify` | `peer`, `words`, `fingerprint`, `pin`, `known_name` | A channel is up, awaiting your accept/reject. `pin` is `new`, `known`, or `changed`. |
 | `accepted` | `peer`, `fingerprint` | *You* accepted; the peer has been told. |
@@ -250,7 +274,7 @@ ends — the natural fit for "one game, one process"), and a bare peer address t
 
 | Command | Fields | Meaning |
 |---------|--------|---------|
-| `connect` | `peer`, `addrs` (optional) | Dial a peer. `addrs` are explicit `ip:port` addresses, to skip discovery. |
+| `connect` | `peer`, `addrs` (optional) | Dial a peer — `peer` takes any address form (hex, `kiss1…`, or the 24 words). `addrs` are explicit `ip:port` addresses, to skip discovery. |
 | `accept` | — | Accept the peer being verified. |
 | `reject` | — | Reject the peer being verified. |
 | `send` | `text` | Send a message. Only valid after `connected`. |
@@ -266,7 +290,7 @@ changes only if a conforming consumer would break.
 ### A session, end to end
 
 ```jsonl
-← {"event":"ready","proto":1,"address":"96aede…","fingerprint":"3c9a…","name":null,"direct_addrs":["192.168.1.7:52400"]}
+← {"event":"ready","proto":1,"address":"96aede…","address_bech32":"kiss1j6hd…","address_words":"note ivory range …","fingerprint":"3c9a…","name":null,"direct_addrs":["192.168.1.7:52400"]}
 → {"cmd":"connect","peer":"b1c2…"}
 ← {"event":"connecting","peer":"b1c2…"}
 ← {"event":"verify","peer":"b1c2…","words":"vault sketch tide …","fingerprint":"77aa…","pin":"new","known_name":null}

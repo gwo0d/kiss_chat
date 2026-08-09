@@ -188,6 +188,25 @@ mod tests {
     }
 
     #[test]
+    fn encodings_match_independent_vectors() {
+        // Both forms of `some_id`, computed by a from-scratch Python
+        // implementation of bech32m (BIP-350) and the BIP39 mnemonic scheme.
+        // Round-trip tests can't catch an encode/decode pair that agrees on the
+        // wrong format; these vectors pin the formats themselves — a mismatch
+        // here would break addresses shared between kiss_chat versions.
+        let id = some_id();
+        assert_eq!(
+            to_bech32(&id),
+            "kiss14ev0lzpnysdvstt07as3q3hdv76swtg593vg6qrra9pdnf64q2mqgsggj0"
+        );
+        assert_eq!(
+            to_words(&id),
+            "purity side tilt green double goat remember year genre lion robust sorry \
+             expire notable expose mention minimum adapt where mad omit pride approve shrug"
+        );
+    }
+
+    #[test]
     fn parse_survives_terminal_damage() {
         let id = some_id();
 
