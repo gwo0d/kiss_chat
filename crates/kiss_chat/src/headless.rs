@@ -107,7 +107,13 @@ pub struct Options {
 /// What the process exits with. See the module docs on the lifecycle.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Exit {
-    /// Clean exit: `quit`, EOF, or (under `--once`) a session that ended normally.
+    /// Clean exit: `quit`, EOF, or (under `--once`) a session that ended.
+    ///
+    /// "Ended" covers every way a *established* session finishes, including one cut
+    /// short because the peer broke the protocol — the exit code says the run is
+    /// over, and the preceding `disconnected` event says why. Only [`Exit::Refused`]
+    /// gets its own code, because a rejected identity is a decision the caller
+    /// configured rather than something that merely happened.
     Ok,
     /// Under `--once`: a dial or handshake that never established.
     Failed,

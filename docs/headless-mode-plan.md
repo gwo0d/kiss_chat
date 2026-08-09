@@ -18,8 +18,11 @@
 >    `contacts`/`identity` call site in `app.rs` moved to its `_in(dir)` variant.
 > 3. **The QUIC idle-timeout risk (§9) resolved itself.** iroh 1.0.1 already sets
 >    a 5s keepalive against a 15s path idle timeout, so no keepalive
->    configuration was needed; verified empirically by a 5-minute idle soak
->    (20× the timeout) with messages flowing in both directions afterwards.
+>    configuration was needed. Verified empirically: a session held idle for 300
+>    seconds — 20× the path idle timeout, so a broken keepalive would have shown
+>    within ~20s — then carried messages in both directions. The soak is a manual
+>    check (five minutes is too long for CI), run from
+>    `examples/python/kiss_pipe.py` against a release build.
 >
 > The deferred `Rejected` frame (§10) remains deferred, and is now purely
 > additive thanks to the unknown-frame tolerance that shipped with it.
