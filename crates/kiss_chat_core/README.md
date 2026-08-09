@@ -14,6 +14,7 @@ interface:
 | Module | Responsibility |
 | --- | --- |
 | `identity` | persistent on-disk keys (iroh address + ML-DSA auth seed) |
+| `address` | human-friendly address encodings (`kiss1…` bech32m, 24 words) and forgiving parsing |
 | `contacts` | pinned contact list: remembers each peer's ML-DSA key (TOFU) |
 | `transport` | iroh: bind, dial-by-key, accept (handles NAT traversal) |
 | `proto` | length-prefixed framing over the QUIC stream |

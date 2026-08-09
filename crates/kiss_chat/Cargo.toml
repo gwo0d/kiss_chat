@@ -17,6 +17,7 @@ kiss_chat_core.workspace = true
 anyhow.workspace = true
 crossterm.workspace = true
 iroh.workspace = true
+qrcode.workspace = true
 ratatui.workspace = true
 serde.workspace = true
 serde_json.workspace = true

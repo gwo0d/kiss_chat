@@ -16,6 +16,7 @@
 //! | Module | Responsibility |
 //! | --- | --- |
 //! | [`identity`] | persistent on-disk keys (iroh address + ML-DSA auth seed) |
+//! | [`address`] | human-friendly address encodings (`kiss1…`, 24 words) and parsing |
 //! | [`contacts`] | pinned contact list: remembers each peer's ML-DSA key (TOFU) |
 //! | [`transport`] | iroh: bind, dial-by-key, accept (handles NAT traversal) |
 //! | [`proto`] | length-prefixed framing over the QUIC stream |
@@ -30,12 +31,14 @@
 //! their needs: expect breaking changes between minor versions (signalled by
 //! semver) until 1.0.
 
+pub mod address;
 pub mod contacts;
 pub mod crypto;
 pub mod identity;
 pub mod message;
 pub mod proto;
 pub mod transport;
+mod wordlist;
 
 #[cfg(test)]
 mod test_support;

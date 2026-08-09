@@ -17,7 +17,7 @@
 //!
 //! | Event | Fields | When |
 //! | --- | --- | --- |
-//! | `ready` | `proto`, `address`, `fingerprint`, `name`, `direct_addrs` | Once, after binding. Everything needed to build an invitation. `direct_addrs` is best-effort and may be empty this early — an `address` is all a peer needs. |
+//! | `ready` | `proto`, `address`, `address_bech32`, `address_words`, `fingerprint`, `name`, `direct_addrs` | Once, after binding. Everything needed to build an invitation. `address` is the canonical hex form; `address_bech32` (`kiss1…`) and `address_words` (24 words) are the same address for humans. `direct_addrs` is best-effort and may be empty this early — an `address` is all a peer needs. |
 //! | `connecting` | `peer` | A dial started. |
 //! | `verify` | `peer`, `words`, `fingerprint`, `pin`, `known_name` | A channel is up and awaiting an accept/reject decision. |
 //! | `accepted` | `peer`, `fingerprint` | *We* accepted; the peer has been told. |
@@ -31,7 +31,7 @@
 //!
 //! | Command | Fields | Meaning |
 //! | --- | --- | --- |
-//! | `connect` | `peer`, `addrs` (optional) | Dial a peer, optionally at explicit `ip:port` addresses. |
+//! | `connect` | `peer`, `addrs` (optional) | Dial a peer — `peer` may be any address form (hex, `kiss1…`, or the 24 words) — optionally at explicit `ip:port` addresses. |
 //! | `accept` | — | Accept the peer being verified. |
 //! | `reject` | — | Reject the peer being verified. |
 //! | `send` | `text` | Send a chat message. Only valid after `connected`. |
@@ -49,7 +49,6 @@
 use std::collections::BTreeSet;
 use std::net::SocketAddr;
 use std::path::PathBuf;
-use std::str::FromStr;
 
 use anyhow::{Context, Result};
 use iroh::{Endpoint, EndpointAddr, EndpointId, SecretKey, TransportAddr};
@@ -59,7 +58,7 @@ use tokio::sync::mpsc;
 
 use kiss_chat_core::contacts::PinStatus;
 use kiss_chat_core::message::Outgoing;
-use kiss_chat_core::{contacts, identity, message, transport};
+use kiss_chat_core::{address, contacts, identity, message, transport};
 
 use crate::net::{
     ConnResult, Established, LiveSession, NET_EVENT_QUEUE, NetEvent, arm_accept, farewell,
@@ -140,6 +139,10 @@ enum Event {
     Ready {
         proto: u32,
         address: String,
+        /// The same address in its human-friendly forms; a controller building an
+        /// invitation for people can hand these on instead of the hex.
+        address_bech32: String,
+        address_words: String,
         fingerprint: String,
         name: Option<String>,
         direct_addrs: Vec<String>,
@@ -312,6 +315,8 @@ async fn event_loop(
     sink.emit(&Event::Ready {
         proto: PROTO_VERSION,
         address: my_id.to_string(),
+        address_bech32: address::to_bech32(&my_id),
+        address_words: address::to_words(&my_id),
         fingerprint: contacts::fingerprint(
             kiss_chat_core::crypto::SigningIdentity::from_seed(&auth_seed).public_bytes(),
         ),
@@ -333,7 +338,7 @@ async fn event_loop(
     let mut peer_short = String::new();
 
     if let Some(arg) = &options.peer {
-        match EndpointId::from_str(arg.trim()) {
+        match address::parse(arg) {
             Ok(peer) => {
                 sink.emit(&Event::Connecting {
                     peer: peer.to_string(),
@@ -341,9 +346,9 @@ async fn event_loop(
                 .await?;
                 spawn_dial(endpoint, my_id, peer, auth_seed, &conn_tx);
             }
-            Err(_) => {
+            Err(err) => {
                 sink.emit(&Event::Error {
-                    message: format!("invalid peer id: {arg}"),
+                    message: format!("invalid peer address: {err}"),
                 })
                 .await?;
                 if options.once {
@@ -379,11 +384,14 @@ async fn event_loop(
                 match cmd {
                     Cmd::Quit => break,
                     Cmd::Connect { peer, addrs } => {
-                        let Ok(peer_id) = EndpointId::from_str(peer.trim()) else {
-                            sink.emit(&Event::Error {
-                                message: format!("invalid peer id: {peer}"),
-                            }).await?;
-                            continue;
+                        let peer_id = match address::parse(&peer) {
+                            Ok(peer_id) => peer_id,
+                            Err(err) => {
+                                sink.emit(&Event::Error {
+                                    message: format!("invalid peer address: {err}"),
+                                }).await?;
+                                continue;
+                            }
                         };
                         let target = match endpoint_addr(peer_id, &addrs) {
                             Ok(target) => target,
@@ -928,6 +936,8 @@ mod tests {
         let ready = as_json(&Event::Ready {
             proto: PROTO_VERSION,
             address: "abc".into(),
+            address_bech32: "kiss1abc".into(),
+            address_words: "alpha beta".into(),
             fingerprint: "def".into(),
             name: None,
             direct_addrs: vec!["127.0.0.1:1234".into()],
@@ -935,6 +945,8 @@ mod tests {
         assert_eq!(ready["event"], "ready");
         assert_eq!(ready["proto"], 1);
         assert_eq!(ready["address"], "abc");
+        assert_eq!(ready["address_bech32"], "kiss1abc");
+        assert_eq!(ready["address_words"], "alpha beta");
         // An absent name is explicitly null rather than missing, so a consumer can
         // read the field unconditionally.
         assert!(ready["name"].is_null());
@@ -1086,6 +1098,42 @@ mod tests {
     }
 
     // --- full-stack loopback scenarios -------------------------------------
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn ready_reports_every_address_form_and_the_word_form_dials() {
+        let listener_endpoint = bind_local().await;
+        let dialer_endpoint = bind_local().await;
+        let listener_id = listener_endpoint.id();
+        let listener_addrs = dialable_addrs(&listener_endpoint).await;
+
+        let mut listener = start(listener_endpoint, ephemeral_options());
+        let mut dialer = start(dialer_endpoint, ephemeral_options());
+
+        // The human-friendly forms in `ready` are the same address, re-encoded —
+        // a controller may hand any of them to the humans on either end.
+        let ready = listener.wait_for("ready").await;
+        assert_eq!(ready["address"], listener_id.to_string());
+        let words = ready["address_words"].as_str().unwrap().to_string();
+        let bech32 = ready["address_bech32"].as_str().unwrap();
+        assert_eq!(address::parse(bech32).unwrap(), listener_id);
+        assert_eq!(address::parse(&words).unwrap(), listener_id);
+        dialer.wait_for("ready").await;
+
+        // And `connect` takes the human forms back: dial by the 24 words.
+        let addrs = serde_json::to_string(&listener_addrs).unwrap();
+        dialer
+            .send(&format!(
+                r#"{{"cmd":"connect","peer":"{words}","addrs":{addrs}}}"#
+            ))
+            .await;
+        let verify = dialer.wait_for("verify").await;
+        assert_eq!(verify["peer"], listener_id.to_string());
+
+        dialer.send(r#"{"cmd":"quit"}"#).await;
+        assert_eq!(dialer.finish().await, Exit::Ok);
+        listener.send(r#"{"cmd":"quit"}"#).await;
+        assert_eq!(listener.finish().await, Exit::Ok);
+    }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn two_instances_verify_accept_and_exchange_messages() {

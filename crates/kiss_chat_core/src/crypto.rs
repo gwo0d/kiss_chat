@@ -48,6 +48,8 @@ use sha2::{Digest, Sha256};
 use x25519_dalek::{PublicKey, StaticSecret};
 use zeroize::{Zeroize, Zeroizing};
 
+use crate::wordlist;
+
 /// Length of an X25519 public key, in bytes.
 const X25519_LEN: usize = 32;
 /// Encoded length of an ML-KEM-1024 encapsulation key (FIPS 203).
@@ -65,18 +67,12 @@ const HKDF_INFO_PREFIX: &[u8] = b"kiss-chat/0 e2e session";
 const SIG_CONTEXT: &[u8] = b"kiss-chat/0 handshake signature";
 /// Domain separator for the safety-number derivation.
 const SN_CONTEXT: &[u8] = b"kiss-chat/0 safety number";
-/// Words in the safety phrase we surface out-of-band, and bits each encodes.
-/// 12 words × 11 bits = 132 bits, so even a MITM's best online collision search
-/// (~2^66 hashes) stays out of reach, while a dozen distinct words are far easier
-/// to read aloud and compare accurately than a hex string.
+/// Words in the safety phrase we surface out-of-band. Each encodes
+/// [`wordlist::WORD_BITS`] bits: 12 words × 11 bits = 132 bits, so even a MITM's
+/// best online collision search (~2^66 hashes) stays out of reach, while a dozen
+/// distinct words are far easier to read aloud and compare accurately than a hex
+/// string.
 const SN_WORDS: usize = 12;
-const SN_WORD_BITS: usize = 11;
-
-/// The BIP39 English wordlist (2048 = 2^11 words), embedded verbatim. It only has
-/// to be consistent between two kiss_chat instances — we use it purely to render a
-/// digest as a memorable phrase — but a vetted, phonetically-distinct list keeps
-/// spoken comparison reliable. SHA-256: 2f5eed53…3b24dbda.
-const BIP39_ENGLISH: &str = include_str!("bip39-english.txt");
 
 /// Nonce direction tag for initiator -> responder traffic.
 const DIR_I2R: [u8; 4] = [0, 0, 0, 1];
@@ -412,28 +408,11 @@ fn safety_number(transcript: &[u8]) -> String {
         .chain_update(SN_CONTEXT)
         .chain_update(transcript)
         .finalize();
-    let words: Vec<&str> = BIP39_ENGLISH.lines().collect();
-    debug_assert_eq!(
-        words.len(),
-        1 << SN_WORD_BITS,
-        "wordlist must be 2^11 entries"
-    );
+    let words = wordlist::words();
     (0..SN_WORDS)
-        .map(|i| words[take_bits(&digest, i * SN_WORD_BITS, SN_WORD_BITS)])
+        .map(|i| words[wordlist::take_bits(&digest, i * wordlist::WORD_BITS, wordlist::WORD_BITS)])
         .collect::<Vec<_>>()
         .join(" ")
-}
-
-/// Read `n` bits (n ≤ 16) from `bytes` starting at bit `offset`, most-significant
-/// bit first, as an integer. Used to slice the digest into wordlist indices.
-fn take_bits(bytes: &[u8], offset: usize, n: usize) -> usize {
-    let mut value = 0usize;
-    for i in 0..n {
-        let bit = offset + i;
-        let set = (bytes[bit / 8] >> (7 - (bit % 8))) & 1;
-        value = (value << 1) | set as usize;
-    }
-    value
 }
 
 /// An established, authenticated, quantum-resistant session.
@@ -781,14 +760,11 @@ mod tests {
     #[test]
     fn safety_number_is_a_valid_word_phrase() {
         // Twelve space-separated words, each drawn from the embedded wordlist.
-        let wordlist: std::collections::HashSet<&str> = BIP39_ENGLISH.lines().collect();
-        assert_eq!(wordlist.len(), 1 << SN_WORD_BITS, "2048 distinct words");
-
         let phrase = safety_number(b"anything");
         let words: Vec<&str> = phrase.split(' ').collect();
         assert_eq!(words.len(), SN_WORDS);
         assert!(
-            words.iter().all(|w| wordlist.contains(w)),
+            words.iter().all(|w| wordlist::index_of(w).is_some()),
             "every word must come from the wordlist"
         );
     }
@@ -797,8 +773,8 @@ mod tests {
     fn take_bits_reads_big_endian() {
         // 0xA6 = 0b1010_0110, 0xC0 = 0b1100_0000.
         let bytes = [0xA6, 0xC0];
-        assert_eq!(take_bits(&bytes, 0, 5), 0b10100);
-        assert_eq!(take_bits(&bytes, 5, 6), 0b110110);
+        assert_eq!(wordlist::take_bits(&bytes, 0, 5), 0b10100);
+        assert_eq!(wordlist::take_bits(&bytes, 5, 6), 0b110110);
     }
 
     #[test]

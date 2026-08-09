@@ -7,28 +7,33 @@
 //! terminal. This module is what turns those events into a UI.
 
 use std::path::{Path, PathBuf};
-use std::str::FromStr;
 
 use anyhow::Result;
-use crossterm::event::{Event, KeyEvent, KeyEventKind};
-use iroh::{Endpoint, EndpointId};
+use crossterm::event::{
+    DisableBracketedPaste, EnableBracketedPaste, Event, KeyEvent, KeyEventKind,
+};
+use iroh::Endpoint;
 use ratatui::DefaultTerminal;
 use tokio::sync::mpsc;
 
 use kiss_chat_core::contacts::PinStatus;
 use kiss_chat_core::message::Outgoing;
-use kiss_chat_core::{contacts, identity, message, transport};
+use kiss_chat_core::{address, contacts, identity, message, transport};
 
 use crate::net::{
     ConnResult, Established, LiveSession, NET_EVENT_QUEUE, NetEvent, arm_accept, farewell,
     spawn_dial, spawn_reader, spawn_writer,
 };
-use crate::ui::{Action, App};
+use crate::ui::{Action, App, OwnAddress};
 
 /// Terminal input forwarded from the blocking reader thread into the async loop.
 enum Input {
     /// A key press to interpret.
     Key(KeyEvent),
+    /// A pasted string, delivered whole. Bracketed paste is what makes this one
+    /// event instead of a stream of key presses — pasted newlines must insert,
+    /// never act as Enter and submit half the paste.
+    Paste(String),
     /// A terminal resize. Carries no data — it exists only to wake the loop so the
     /// UI redraws at the new size (the draw happens at the top of every iteration).
     Resize,
@@ -46,7 +51,7 @@ pub fn print_usage_to(out: &mut impl std::io::Write) {
         "kiss_chat {} — P2P quantum-resistant chat\n\n\
          usage:\n\
          \x20 kiss_chat                    listen in the lobby; share your address and wait\n\
-         \x20 kiss_chat <peer-id>          dial a peer immediately\n\
+         \x20 kiss_chat <address>          dial a peer immediately (hex, kiss1…, or 24 words)\n\
          \x20 kiss_chat --config-dir <dir> keep this session's identity in <dir>\n\
          \x20 kiss_chat --version          print the version and exit (also -v)\n\n\
          headless (driven by another program over stdin/stdout as JSON lines):\n\
@@ -55,9 +60,9 @@ pub fn print_usage_to(out: &mut impl std::io::Write) {
          \x20   --expect <fingerprint>   only talk to this identity; may be repeated\n\
          \x20   --name <text>            display name for this run (not saved)\n\
          \x20   --once                   exit when the first session ends\n\
-         \x20   [peer-id]                dial this peer on startup\n\n\
-         inside the app: /connect <peer-id>, /accept, /reject, /name, /safety,\n\
-         \x20               /contacts, /address, /clear, /version, /help, /quit",
+         \x20   [address]                dial this peer on startup\n\n\
+         inside the app: /connect <address>, /accept, /reject, /name, /safety,\n\
+         \x20               /contacts, /address, /qr, /clear, /version, /help, /quit",
         env!("CARGO_PKG_VERSION")
     );
 }
@@ -91,8 +96,8 @@ fn list_contacts(app: &mut App, config_dir: &Path) {
 /// always restored before returning, even if the loop errors out.
 ///
 /// `config_dir` overrides where the identity, contacts, and display name live;
-/// `None` uses the user's own config directory. `peer_arg` is an optional peer id
-/// (an iroh [`EndpointId`]) to dial on startup.
+/// `None` uses the user's own config directory. `peer_arg` is an optional peer
+/// address, in any form [`address::parse`] accepts, to dial on startup.
 ///
 /// # Errors
 ///
@@ -112,6 +117,9 @@ pub async fn run(config_dir: Option<PathBuf>, peer_arg: Option<String>) -> Resul
         identity::load_display_name_in(&config_dir)?.and_then(|n| message::sanitize_name(&n));
 
     let mut terminal = ratatui::init();
+    // Best-effort: a terminal without bracketed paste just keeps the old
+    // behaviour (a paste arrives as key presses, newlines acting as Enter).
+    let _ = crossterm::execute!(std::io::stdout(), EnableBracketedPaste);
     let result = event_loop(
         &mut terminal,
         endpoint,
@@ -121,6 +129,7 @@ pub async fn run(config_dir: Option<PathBuf>, peer_arg: Option<String>) -> Resul
         display_name,
     )
     .await;
+    let _ = crossterm::execute!(std::io::stdout(), DisableBracketedPaste);
     ratatui::restore();
     result
 }
@@ -137,7 +146,11 @@ async fn event_loop(
     display_name: Option<String>,
 ) -> Result<()> {
     let my_id = endpoint.id();
-    let mut app = App::new(my_id.to_string());
+    let mut app = App::new(OwnAddress {
+        hex: my_id.to_string(),
+        bech32: address::to_bech32(&my_id),
+        words: address::to_words(&my_id),
+    });
 
     // Our own display name (optional) and the two halves of mutual acceptance:
     // whether we've accepted the current peer, and whether they've accepted us.
@@ -155,6 +168,7 @@ async fn event_loop(
             let forward = match event {
                 // Ignore key-release/repeat noise (notably on Windows).
                 Event::Key(key) if key.kind == KeyEventKind::Press => Input::Key(key),
+                Event::Paste(text) => Input::Paste(text),
                 Event::Resize(..) => Input::Resize,
                 _ => continue,
             };
@@ -172,12 +186,14 @@ async fn event_loop(
 
     // Optional auto-dial from the command line.
     if let Some(arg) = peer_arg {
-        match EndpointId::from_str(arg.trim()) {
+        match address::parse(&arg) {
             Ok(peer) => {
                 app.set_connecting(peer.fmt_short().to_string());
                 spawn_dial(&endpoint, my_id, peer, auth_seed, &conn_tx);
             }
-            Err(_) => app.push_system("ignoring invalid peer id from the command line"),
+            Err(err) => {
+                app.push_system(format!("ignoring the address from the command line: {err}"))
+            }
         }
     }
 
@@ -194,12 +210,17 @@ async fn event_loop(
                 let Some(input) = input else { break }; // input thread ended
                 let key = match input {
                     Input::Key(key) => key,
+                    // A paste only ever edits the input line; nothing to act on.
+                    Input::Paste(text) => {
+                        app.on_paste(&text);
+                        continue;
+                    }
                     // A resize needs only a redraw, done at the top of the next loop.
                     Input::Resize => continue,
                 };
                 match app.on_key(key) {
                     Action::Quit => break,
-                    Action::Connect(id) => match EndpointId::from_str(id.trim()) {
+                    Action::Connect(id) => match address::parse(&id) {
                         Ok(peer) => {
                             // If we're already connected, leave the current peer first
                             // (announcing our departure) before dialing the new one.
@@ -216,7 +237,7 @@ async fn event_loop(
                             app.set_connecting(peer.fmt_short().to_string());
                             spawn_dial(&endpoint, my_id, peer, auth_seed, &conn_tx);
                         }
-                        Err(_) => app.push_system("invalid peer id"),
+                        Err(err) => app.push_system(format!("invalid address: {err}")),
                     },
                     Action::Accept => {
                         // Now — and only now — is it safe to share our display name.
