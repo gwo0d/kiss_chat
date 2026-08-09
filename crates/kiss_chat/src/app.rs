@@ -6,6 +6,7 @@
 //! reader/writer tasks — lives in [`crate::net`], which knows nothing about the
 //! terminal. This module is what turns those events into a UI.
 
+use std::path::{Path, PathBuf};
 use std::str::FromStr;
 
 use anyhow::Result;
@@ -35,12 +36,26 @@ enum Input {
 
 /// Print command-line usage to stdout.
 pub fn print_usage() {
-    println!(
+    print_usage_to(&mut std::io::stdout());
+}
+
+/// Print command-line usage to `out` (stderr, when usage follows an error).
+pub fn print_usage_to(out: &mut impl std::io::Write) {
+    let _ = writeln!(
+        out,
         "kiss_chat {} — P2P quantum-resistant chat\n\n\
          usage:\n\
-         \x20 kiss_chat              listen in the lobby; share your address and wait\n\
-         \x20 kiss_chat <peer-id>    dial a peer immediately\n\
-         \x20 kiss_chat --version    print the version and exit (also -v)\n\n\
+         \x20 kiss_chat                    listen in the lobby; share your address and wait\n\
+         \x20 kiss_chat <peer-id>          dial a peer immediately\n\
+         \x20 kiss_chat --config-dir <dir> keep this session's identity in <dir>\n\
+         \x20 kiss_chat --version          print the version and exit (also -v)\n\n\
+         headless (driven by another program over stdin/stdout as JSON lines):\n\
+         \x20 kiss_chat --headless --ephemeral            throwaway identity, nothing on disk\n\
+         \x20 kiss_chat --headless --config-dir <dir>     identity kept in <dir>\n\
+         \x20   --expect <fingerprint>   only talk to this identity; may be repeated\n\
+         \x20   --name <text>            display name for this run (not saved)\n\
+         \x20   --once                   exit when the first session ends\n\
+         \x20   [peer-id]                dial this peer on startup\n\n\
          inside the app: /connect <peer-id>, /accept, /reject, /name, /safety,\n\
          \x20               /contacts, /address, /clear, /version, /help, /quit",
         env!("CARGO_PKG_VERSION")
@@ -54,8 +69,8 @@ pub fn print_version() {
 
 /// List the peers we've accepted before (name, if cached, and full address so it can
 /// be copied straight into `/connect`) into the message pane.
-fn list_contacts(app: &mut App) {
-    match contacts::known_peers() {
+fn list_contacts(app: &mut App, config_dir: &Path) {
+    match contacts::known_peers_in(config_dir) {
         Ok(peers) if peers.is_empty() => {
             app.push_system("no known peers yet — accepting a peer remembers them here");
         }
@@ -75,21 +90,37 @@ fn list_contacts(app: &mut App) {
 /// over the terminal, and run the event loop until the user quits. The terminal is
 /// always restored before returning, even if the loop errors out.
 ///
-/// `peer_arg` is an optional peer id (an iroh [`EndpointId`]) to dial on startup.
+/// `config_dir` overrides where the identity, contacts, and display name live;
+/// `None` uses the user's own config directory. `peer_arg` is an optional peer id
+/// (an iroh [`EndpointId`]) to dial on startup.
 ///
 /// # Errors
 ///
 /// Fails if the endpoint can't bind or the persistent identity can't be loaded;
 /// the terminal is always restored before returning, error or not.
-pub async fn run(peer_arg: Option<String>) -> Result<()> {
-    let endpoint = transport::bind().await?;
-    let auth_seed = identity::load_or_create_auth_seed()?;
+pub async fn run(config_dir: Option<PathBuf>, peer_arg: Option<String>) -> Result<()> {
+    let config_dir = match config_dir {
+        Some(dir) => dir,
+        None => identity::config_dir()?,
+    };
+    let endpoint =
+        transport::bind_with(identity::load_or_create_endpoint_secret_in(&config_dir)?).await?;
+    let auth_seed = identity::load_or_create_auth_seed_in(&config_dir)?;
     // An optional, previously-saved display name. Sanitised so a hand-edited file
     // can't feed control characters or an over-long name into the session.
-    let display_name = identity::load_display_name()?.and_then(|n| message::sanitize_name(&n));
+    let display_name =
+        identity::load_display_name_in(&config_dir)?.and_then(|n| message::sanitize_name(&n));
 
     let mut terminal = ratatui::init();
-    let result = event_loop(&mut terminal, endpoint, peer_arg, auth_seed, display_name).await;
+    let result = event_loop(
+        &mut terminal,
+        endpoint,
+        &config_dir,
+        peer_arg,
+        auth_seed,
+        display_name,
+    )
+    .await;
     ratatui::restore();
     result
 }
@@ -100,6 +131,7 @@ pub async fn run(peer_arg: Option<String>) -> Result<()> {
 async fn event_loop(
     terminal: &mut DefaultTerminal,
     endpoint: Endpoint,
+    config_dir: &Path,
     peer_arg: Option<String>,
     auth_seed: [u8; 32],
     display_name: Option<String>,
@@ -200,7 +232,7 @@ async fn event_loop(
                             let _ = live.outgoing_tx.send(Outgoing::Accepted);
                             // Pin (or re-pin) this peer's identity key so a future
                             // change is flagged. Accepting is the user asserting trust.
-                            if let Err(err) = contacts::remember(&live.peer_id, &live.peer_identity)
+                            if let Err(err) = contacts::remember_in(config_dir, &live.peer_id, &live.peer_identity)
                             {
                                 app.push_system(format!("could not save contact: {err}"));
                             }
@@ -208,7 +240,7 @@ async fn event_loop(
                             // cache it against the fresh pin now.
                             if live.peer_name.is_some() {
                                 if let Err(err) =
-                                    contacts::set_name(&live.peer_id, live.peer_name.as_deref())
+                                    contacts::set_name_in(config_dir, &live.peer_id, live.peer_name.as_deref())
                                 {
                                     app.push_system(format!(
                                         "could not save contact name: {err}"
@@ -238,7 +270,7 @@ async fn event_loop(
                     }
                     Action::SetName(raw) => {
                         my_name = message::sanitize_name(&raw);
-                        if let Err(err) = identity::save_display_name(my_name.as_deref()) {
+                        if let Err(err) = identity::save_display_name_in(config_dir, my_name.as_deref()) {
                             app.push_system(format!("could not save display name: {err}"));
                         }
                         match &my_name {
@@ -256,7 +288,7 @@ async fn event_loop(
                             let _ = live.outgoing_tx.send(Outgoing::Text(line));
                         }
                     }
-                    Action::ListContacts => list_contacts(&mut app),
+                    Action::ListContacts => list_contacts(&mut app, config_dir),
                     Action::None => {}
                 }
             }
@@ -283,7 +315,7 @@ async fn event_loop(
                         // (by their cached name), or a changed identity key.
                         let peer_id = peer.to_string();
                         let peer_identity = new_session.peer_identity().to_vec();
-                        let (pin, known_name) = match contacts::recognize(&peer_id, &peer_identity) {
+                        let (pin, known_name) = match contacts::recognize_in(config_dir, &peer_id, &peer_identity) {
                             Ok(rec) => (rec.status, rec.name),
                             Err(err) => {
                                 app.push_system(format!("could not read contacts: {err}"));
@@ -365,7 +397,7 @@ async fn event_loop(
                     if let Some(live) = &mut session {
                         live.peer_name = name.clone();
                         if accepted
-                            && let Err(err) = contacts::set_name(&live.peer_id, name.as_deref())
+                            && let Err(err) = contacts::set_name_in(config_dir, &live.peer_id, name.as_deref())
                         {
                             app.push_system(format!("could not save contact name: {err}"));
                         }

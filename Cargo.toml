@@ -31,6 +31,10 @@ iroh = "1.0.1"
 ml-dsa = { version = "0.1.1", features = ["zeroize"] }
 ml-kem = { version = "0.3.2", features = ["getrandom", "zeroize"] }
 ratatui = "0.30.2"
+# Only the binary crate uses these, for the headless frontend's JSON protocol;
+# kiss_chat_core stays serialisation-agnostic.
+serde = { version = "1.0.229", features = ["derive"] }
+serde_json = "1.0.151"
 sha2 = { version = "0.11.0", features = ["zeroize"] }
 tokio = "1.52.3"
 x25519-dalek = { version = "3.0.0", features = ["static_secrets", "zeroize"] }
