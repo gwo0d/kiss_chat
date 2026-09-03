@@ -106,17 +106,14 @@ jobs:
         with:
           tool: cargo-audit
       - name: Audit dependencies
-        # Ignored advisories are transitive-only and not remotely reachable in
-        # kiss_chat; see the reasoning below. Any *new* advisory still fails CI.
+        # The one ignored advisory is transitive and warning-only. Any *new*
+        # advisory still fails CI.
         #
-        #   RUSTSEC-2026-0194 / -0195  quick-xml DoS. Pulled in via
-        #     iroh -> netwatch -> netdev -> plist -> quick-xml; plist pins an
-        #     old quick-xml and is already at its latest release, so it cannot be
-        #     bumped from here. It only parses the local OS network-interface
-        #     plist, never peer-supplied bytes, so it is not remotely reachable.
         #   RUSTSEC-2024-0436  `paste` unmaintained. Warning only, transitive.
+        #
+        # The quick-xml pair (RUSTSEC-2026-0194 / -0195) used to be ignored here
+        # too; the tree now resolves quick-xml 0.41.0, which is the patched
+        # version for both, so the suppressions are gone rather than left to rot.
         run: >
           cargo audit
-          --ignore RUSTSEC-2026-0194
-          --ignore RUSTSEC-2026-0195
           --ignore RUSTSEC-2024-0436
