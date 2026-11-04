@@ -1,6 +1,7 @@
-# Dependabot keeps Cargo.lock and the workflows' actions current, so fixes
-# for newly published advisories arrive as a pull request rather than as a
-# red weekly `cargo audit` run on main.
+# Dependabot keeps the Rust dependencies and the workflows' actions current,
+# so fixes for newly published advisories arrive as a pull request rather
+# than as a red weekly `cargo audit` run on main, and breaking upgrades are
+# proposed rather than discovered.
 #
 # Security updates (pull requests raised as soon as an advisory affecting us
 # is published) are switched on in the repository settings, not here; the
@@ -23,22 +24,27 @@ updates:
     # direct ones unless told otherwise.
     allow:
       - dependency-type: all
-    # Propose only what `cargo update` would: semver-compatible bumps within
-    # the ranges Cargo.toml already allows. Breaking upgrades and raised floors
-    # in [workspace.dependencies] stay deliberate, manual changes.
-    # resolver = "3" keeps the chosen versions within the MSRV.
-    versioning-strategy: lockfile-only
+    # For Cargo, `auto` raises a requirement only when it doesn't already
+    # allow the new version: a semver-compatible bump touches only Cargo.lock,
+    # and a breaking upgrade also raises the requirement in
+    # [workspace.dependencies]. Either may need a newer Rust than
+    # rust-version; the msrv job fails if so, the cue to raise both together.
+    versioning-strategy: auto
     # Let a new release age a few days before proposing it, so a compromised
     # or quickly yanked publish is less likely to land. Security updates are
     # exempt from this and still arrive straight away.
     cooldown:
       default-days: 3
     groups:
-      # One weekly pull request: the equivalent of a housekeeping
-      # `cargo update`.
+      # One weekly pull request for every semver-compatible bump: the
+      # equivalent of a housekeeping `cargo update`. Dependabot classifies
+      # Cargo versions by Cargo's rules, so 0.30 -> 0.31 counts as major and
+      # stays out of this group. Breaking upgrades each get their own pull
+      # request instead, so one that needs code changes can't hold up the rest.
       cargo:
         applies-to: version-updates
         patterns: ["*"]
+        update-types: ["minor", "patch"]
       # One pull request per batch of advisories rather than one per crate:
       # they tend to land in clusters across related crates (rustls,
       # rustls-webpki, webpki-roots).
