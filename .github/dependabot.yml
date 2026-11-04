@@ -1,0 +1,71 @@
+# Dependabot keeps the Rust dependencies and the workflows' actions current,
+# so fixes for newly published advisories arrive as a pull request rather
+# than as a red weekly `cargo audit` run on main, and breaking upgrades are
+# proposed rather than discovered.
+#
+# Security updates (pull requests raised as soon as an advisory affecting us
+# is published) are switched on in the repository settings, not here; the
+# `security-updates` group below only decides how those pull requests are
+# batched.
+version: 2
+
+updates:
+  - package-ecosystem: cargo
+    # The workspace root: one Cargo.lock covers both crates.
+    directory: /
+    schedule:
+      interval: weekly
+      day: monday
+      # UTC, an hour ahead of the weekly audit in ci.yml, so a fix is usually
+      # already open by the time the audit would flag it.
+      time: "05:00"
+    # Every advisory that has broken CI so far was in a transitive dependency
+    # (h2, rustls, rustls-webpki, ctutils, ...), and Dependabot only looks at
+    # direct ones unless told otherwise.
+    allow:
+      - dependency-type: all
+    # For Cargo, `auto` raises a requirement only when it doesn't already
+    # allow the new version: a semver-compatible bump touches only Cargo.lock,
+    # and a breaking upgrade also raises the requirement in
+    # [workspace.dependencies]. Either may need a newer Rust than
+    # rust-version; the msrv job fails if so, the cue to raise both together.
+    versioning-strategy: auto
+    # Let a new release age a few days before proposing it, so a compromised
+    # or quickly yanked publish is less likely to land. Security updates are
+    # exempt from this and still arrive straight away.
+    cooldown:
+      default-days: 3
+    groups:
+      # One weekly pull request for every semver-compatible bump: the
+      # equivalent of a housekeeping `cargo update`. Dependabot classifies
+      # Cargo versions by Cargo's rules, so 0.30 -> 0.31 counts as major and
+      # stays out of this group. Breaking upgrades each get their own pull
+      # request instead, so one that needs code changes can't hold up the rest.
+      cargo:
+        applies-to: version-updates
+        patterns: ["*"]
+        update-types: ["minor", "patch"]
+      # One pull request per batch of advisories rather than one per crate:
+      # they tend to land in clusters across related crates (rustls,
+      # rustls-webpki, webpki-roots).
+      cargo-security:
+        applies-to: security-updates
+        patterns: ["*"]
+
+  - package-ecosystem: github-actions
+    # Covers every workflow under .github/workflows.
+    directory: /
+    schedule:
+      interval: weekly
+      day: monday
+      time: "05:00"
+    cooldown:
+      default-days: 3
+    ignore:
+      # Its refs are a toolchain channel (@stable) and the pinned MSRV
+      # (@1.91.0), not action versions. Bumping @1.91.0 would quietly stop
+      # the msrv job from checking the MSRV.
+      - dependency-name: dtolnay/rust-toolchain
+    groups:
+      github-actions:
+        patterns: ["*"]
