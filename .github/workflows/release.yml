@@ -47,7 +47,7 @@ jobs:
           - target: x86_64-pc-windows-msvc
             os: windows-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
         with:
           # Build the exact code the release tag points at, on either trigger.
           ref: ${{ github.event.release.tag_name || inputs.tag }}
@@ -101,7 +101,7 @@ jobs:
             + "  $staging.zip" | Out-File -Encoding ascii "$staging.zip.sha256"
 
       - name: Upload assets to the release
-        uses: softprops/action-gh-release@v2
+        uses: softprops/action-gh-release@v3
         with:
           tag_name: ${{ env.TAG }}
           files: |
